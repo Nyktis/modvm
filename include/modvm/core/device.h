@@ -1,69 +1,76 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef MODVM_CORE_DEVICE_H
 #define MODVM_CORE_DEVICE_H
+#include <stdbool.h>
 
-#include <modvm/utils/list.h>
-#include <modvm/core/res_pool.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/list.h>
+#include <modvm/util/res_pool.h>
+#include <modvm/util/types.h>
 
-struct modvm_ctx;
-struct modvm_device;
-struct modvm_device_class;
+struct vm_ctx;
+struct device;
+struct device_desc;
+struct io_region;
 
 /**
- * struct modvm_device_ops - standardized callbacks for hardware emulation
- * @realize: initialize hardware state and claim bus resources
- * @unrealize: release resources prior to destruction
- * @reset: restore the device to its power-on state
- * @read: handle a read request from the virtual processor
- * @write: handle a write request from the virtual processor
+ * struct device_ops - standardized callbacks for hardware emulation
+ * @stop: quiesce callbacks/interrupts before resources are released; partial init safe
+ * @read: handle a read; region identifies the mapping, offset is relative to it
+ * @write: handle a write using the same stable region identity
  */
-struct modvm_device_ops {
-	int (*realize)(struct modvm_device *dev);
-	void (*unrealize)(struct modvm_device *dev);
-	void (*reset)(struct modvm_device *dev);
-
-	uint64_t (*read)(struct modvm_device *dev, uint64_t offset,
-			 uint8_t size);
-	void (*write)(struct modvm_device *dev, uint64_t offset, uint64_t val,
-		      uint8_t size);
+struct device_ops {
+	void (*stop)(struct device *dev);
+	uint64_t (*read)(struct io_region *region, uint64_t offset, uint8_t size);
+	void (*write)(struct io_region *region, uint64_t offset, uint64_t val, uint8_t size);
 };
 
+enum device_state { DEVICE_NEW, DEVICE_INITIALIZING, DEVICE_ACTIVE, DEVICE_FAILED, DEVICE_DESTROYING };
+
+/* Allocation transfers ownership to ctx immediately, even before realization.
+ * destroy permits early removal and consumes the pointer, including children. */
 /**
- * struct modvm_device - base class for all virtual peripherals
+ * struct device - virtual device instance
  * @node: linked list node to attach to the context subsystem
- * @devm_pool: anchor for all dynamically allocated device resources
+ * @resources: anchor for all dynamically allocated device resources
  * @ctx: the parent virtual machine context containing this device
- * @cls: pointer to the device blueprint
- * @name: human-readable identifier for debugging
+ * @desc: description of the device implementation
  * @ops: pointer to the device implementation methods
- * @priv: opaque pointer for device-specific state to prevent arch leakage
+ * @priv: device-specific private state
+ * @state: core-managed lifecycle state, including partial realization
+ * @parent: optional same-VM parent; children are destroyed before the parent
  */
-struct modvm_device {
+struct device {
 	struct list_head node;
-	struct modvm_res_pool devm_pool;
+	struct res_pool resources;
 
-	struct modvm_ctx *ctx;
-	const struct modvm_device_class *cls;
-	const char *name;
-	const struct modvm_device_ops *ops;
+	struct vm_ctx *ctx;
+	const struct device_desc *desc;
+	const struct device_ops *ops;
 	void *priv;
+	enum device_state state;
+	struct device *parent;
 };
 
 /**
- * struct modvm_device_class - hardware implementation blueprint
- * @name: unique string identifier for the device type
- * @instantiate: factory callback to wire up internal routing and allocate state
+ * struct device_desc - device implementation description
+ * @name: name unique within the device registry
+ * @realize: initialize an allocated device and register its resources
  */
-struct modvm_device_class {
+struct device_desc {
 	const char *name;
-	int (*instantiate)(struct modvm_device *dev, void *pdata);
+	int (*realize)(struct device *dev, void *pdata);
 };
 
-void modvm_device_class_register(const struct modvm_device_class *cls);
-struct modvm_device *modvm_device_alloc(struct modvm_ctx *ctx,
-					const char *name);
-int modvm_device_add(struct modvm_device *dev, void *pdata);
-void modvm_device_put(struct modvm_device *dev);
+/* Device hooks run under the VM I/O lock. Nested topology operations must use
+ * these held-lock entry points; ordinary entry points acquire the lock. */
+struct device *device_alloc_locked(struct vm_ctx *ctx, const char *name);
+int device_realize_locked(struct device *dev, void *pdata);
+void device_destroy_locked(struct device *dev);
+
+/* Startup-only registration; invalid, duplicate or excess entries are fatal programming errors. */
+void device_register(const struct device_desc *desc);
+struct device *device_alloc(struct vm_ctx *ctx, const char *name);
+int device_realize(struct device *dev, void *pdata);
+void device_destroy(struct device *dev);
 
 #endif /* MODVM_CORE_DEVICE_H */

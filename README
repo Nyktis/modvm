@@ -1,32 +1,93 @@
 modvm
 ============
 
-modvm is a cross-platform virtual machine hypervisor. This is only a demo version.
+modvm is an experimental virtual machine monitor. The Linux x86_64 PC board
+uses KVM and supports direct Linux boot, a serial console, and VirtIO PCI
+block/network devices.
 
-How to Build (Deprecated)
+Build and test
 -----------
 
-It is recommended to build through CMake and Ninja. GNU Make is also needed to build the firmware. Tested versions are:
+Requires a C11 compiler, CMake, Ninja, and pthreads. From the project root:
 
-* CMake: 4.2.3
-* Ninja: 1.13.2
-* GNU Make: 4.4.1
+    cmake -S . -B build -G Ninja
+    ninja -C build
+    ctest --test-dir build --output-on-failure
 
-First, create a build folder and enter it:
+The executable is build/src/modvm. Tests that create a VM require access to
+/dev/kvm. AddressSanitizer, UndefinedBehaviorSanitizer and hardening are enabled
+by default. Run outside ptrace-based sandboxes for LeakSanitizer support.
 
-`mkdir build && cd build`
-
-Then, run the following command to build modvm:
-
-`CC=<your-cc> cmake -G Ninja .. && ninja`
-
-The executable should then locate in `build/src/`, along with tests located in `build/tests/`.
-
-To build the firmware, run `make` in `firmware/`.
-
-Run the Demo (Deprecated)
+Boot Alpine Linux (x86_64)
 -----------
 
-Make sure you are in the `build/` folder. Then:
+The linux-x86 loader requires Linux boot protocol 2.10 or newer. It loads a
+bzImage and optional initramfs directly; no BIOS/UEFI firmware is needed.
+The host must provide KVM and the user must have read/write access to /dev/kvm.
 
-`./src/modvm -m 1 -smp 3 -kernel ../firmware/boot.bin`
+On Debian, install curl and libarchive-tools (which provides bsdtar). GNU tar
+does not extract ISO images. Download and extract the Alpine Virtual image:
+
+    mkdir -p alpine
+    cd alpine
+    base=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64
+    iso=alpine-virt-3.24.1-x86_64.iso
+    curl -fLO "$base/$iso"
+    curl -fLO "$base/$iso.sha256"
+    sha256sum -c "$iso.sha256"
+    bsdtar -xf "$iso" boot/vmlinuz-virt boot/initramfs-virt
+    cd ..
+
+From the project root, start a single-vCPU, 1 GiB live VM:
+
+    ./build/src/modvm \
+      -board pc -accel kvm -m 1024 -smp 1 \
+      -loader linux-x86 \
+      -drive "driver=linux-file,path=alpine/alpine-virt-3.24.1-x86_64.iso,readonly=on" \
+      -loader-opts "kernel=alpine/boot/vmlinuz-virt,initrd=alpine/boot/initramfs-virt,append=console=ttyS0,115200 modules=virtio_pci,virtio_blk,loop,squashfs,iso9660"
+
+Keep append= last: its value consumes the remainder of the loader options.
+The ISO appears as a VirtIO disk; Alpine discovers its boot partition and
+mounts the included modloop. Log in as root (no password). Press Ctrl+A, then X
+to stop modvm. This live configuration has no network or persistent writable
+disk; changes inside the guest are lost on exit.
+
+The linux-x86 loader requires Linux boot protocol 2.10 or newer. It places
+the initrd above the kernel initialization workspace within addressable RAM.
+The PC board provides MP 1.4 CPU and interrupt tables. ACPI and RTC are not
+implemented. CPU topology is one core and one thread per virtual socket;
+-smp selects the number of sockets/vCPUs (up to 254 on this board).
+
+Alpine networking
+-----------------
+Add -net "driver=linux-tap,ifname=tap0" to the boot command. The host must
+connect tap0 to a network providing DHCP/routing. For an existing libvirt
+virbr0 network with DHCP/NAT already configured:
+
+    sudo ip link set tap0 master virbr0
+    sudo ip link set virbr0 up
+    sudo ip link set tap0 up
+
+Then, inside Alpine:
+
+    ip link set lo up
+    ip link set eth0 up
+    udhcpc -i eth0 -n -q
+
+These host bridge settings are temporary. After a host reboot, create tap0
+again if absent, then attach it to the bridge:
+
+    sudo ip tuntap add dev tap0 mode tap user "$USER"
+
+The libvirt network supplying virbr0 must already be active and provide
+DHCP/NAT. Restart modvm after rebuilding it.
+
+TAP defaults to a randomly generated locally administered unicast MAC.
+For a stable DHCP identity, specify it explicitly:
+  -net "driver=linux-tap,ifname=tap0,mac=52:54:00:12:34:56"
+Use distinct MACs for interfaces sharing a network. Duplicate MACs within
+one VM are rejected.
+
+`raw-x86` loads the file named by `-loader-opts` at GPA 0 and starts real-mode
+execution at CS:IP 0000:0000. This is a flat program loader, not a BIOS ROM
+reset-vector loader.

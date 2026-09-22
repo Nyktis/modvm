@@ -2,28 +2,30 @@
 #ifndef MODVM_CORE_LOADER_H
 #define MODVM_CORE_LOADER_H
 
-#include <modvm/core/modvm.h>
-#include <modvm/core/memory.h>
+struct vm_ctx;
+struct vcpu;
 
 /**
- * struct modvm_loader_class - blueprint for a pluggable boot protocol
- * @name: unique identifier (e.g., "linux-x86", "raw-bios")
+ * struct loader_desc - boot protocol implementation description
+ * @name: name unique within the loader registry (e.g., "linux-x86")
  * @load: injects payloads into memory and establishes initial state.
- * Returns an opaque context pointer via out_priv.
+ * Returns an opaque context pointer via out_priv. Published state is owned by
+ * the VM even when load fails; do not free it after publishing.
  * @setup_bsp: manipulates the Bootstrap Processor (vCPU 0) to meet the
  * entry requirements of this specific protocol.
- * @release: frees any resources tied to the opaque context pointer.
+ * @destroy: destroys published private state, including partially loaded state.
+ * Optional when load publishes no owned resources; does not free the description.
  */
-struct modvm_loader_class {
+struct loader_desc {
 	const char *name;
-	int (*load)(struct modvm_ctx *ctx, const char *opts, void **out_priv);
-	int (*setup_bsp)(struct modvm_vcpu *vcpu, void *priv);
-	void (*release)(void *priv);
+	int (*load)(struct vm_ctx *ctx, const char *opts, void **out_priv);
+	int (*setup_bsp)(struct vcpu *vcpu, void *priv);
+	void (*destroy)(void *priv);
 };
 
-void modvm_loader_class_register(const struct modvm_loader_class *cls);
+/* Startup-only registration; invalid, duplicate or excess entries are fatal programming errors. */
+void loader_register(const struct loader_desc *desc);
 
-int modvm_loader_execute(struct modvm_ctx *ctx, const char *name,
-			 const char *opts);
+int loader_execute(struct vm_ctx *ctx, const char *name, const char *opts);
 
 #endif /* MODVM_CORE_LOADER_H */

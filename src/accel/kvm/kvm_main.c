@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #define _GNU_SOURCE
 
+#include <modvm/host/error.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -9,36 +10,35 @@
 #include <stdatomic.h>
 
 #include <modvm/core/accel.h>
+#include <modvm/core/memory.h>
 #include <modvm/core/vcpu.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/err.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/log.h>
+#include <modvm/util/err.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/types.h>
 
 #include "internal.h"
+#include "signal.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "kvm: " fmt
 
 /**
- * kvm_mem_region_map_cb - bridge between core memory allocator and KVM hardware paging
- * @space: the abstract memory space
+ * kvm_accel_map_ram - bridge between core memory allocator and KVM hardware paging
+ * @accel: the accelerator receiving the RAM mapping
  * @reg: the specific memory region to map
- * @data: pointer to the private KVM state structure
  *
- * Invoked dynamically whenever the core allocates a new memory region.
+ * Invoked during VM construction when the core allocates a new memory region.
  * It strictly binds the host virtual address to the guest physical address
  * via the KVM_SET_USER_MEMORY_REGION ioctl.
  *
  * Return: 0 on success, or a negative error code.
  */
-static int kvm_mem_region_map_cb(struct modvm_mem_space *space,
-				 struct modvm_mem_region *reg, void *data)
+static int kvm_accel_map_ram(struct accel *accel, const struct mem_region *reg)
 {
-	struct modvm_kvm_state *state = data;
+	struct kvm_state *state = accel->priv;
 
 	uint32_t slot_val = MEM_SLOT_VAL(state->mem_slot_idx);
-	state->mem_slot_idx = TO_MEM_SLOT(slot_val + 1);
 
 	struct kvm_userspace_memory_region hw_reg = {
 		.slot = slot_val,
@@ -48,54 +48,18 @@ static int kvm_mem_region_map_cb(struct modvm_mem_space *space,
 		.flags = 0,
 	};
 
-	(void)space;
-
-	if (reg->flags & MODVM_MEM_READONLY)
+	if (reg->flags & MEM_READONLY)
 		hw_reg.flags |= KVM_MEM_READONLY;
 
-	if (ioctl(FD_VAL(state->vm_fd), KVM_SET_USER_MEMORY_REGION, &hw_reg) <
-	    0) {
-		pr_err("failed to commit hardware memory slot: %d\n", errno);
-		return -errno;
+	if (ioctl(FD_VAL(state->vm_fd), KVM_SET_USER_MEMORY_REGION, &hw_reg) < 0) {
+		int error = host_error_from_errno(errno);
+		pr_err("failed to commit hardware memory slot: %d\n", error);
+		return -error;
 	}
 
-	reg->priv = (void *)(uintptr_t)slot_val;
+	state->mem_slot_idx = TO_MEM_SLOT(slot_val + 1);
 
 	return 0;
-}
-
-/**
- * kvm_mem_region_unmap_cb - dismantle hardware memory mappings
- * @space: the abstract memory space
- * @reg: the memory region to dismantle
- * @data: pointer to the private KVM state structure
- *
- * Flushes the KVM hardware page tables by setting the memory_size to 0
- * for the specific slot. This prevents use-after-free corruptions in the
- * host kernel if the guest accesses the unmapped GPA.
- */
-static void kvm_mem_region_unmap_cb(struct modvm_mem_space *space,
-				    struct modvm_mem_region *reg, void *data)
-{
-	struct modvm_kvm_state *state = data;
-	struct kvm_userspace_memory_region hw_reg = {
-		.slot = (uint32_t)(uintptr_t)reg->priv,
-		.guest_phys_addr = 0,
-		.memory_size = 0,
-		.userspace_addr = 0,
-		.flags = 0,
-	};
-
-	(void)space;
-
-	if (ioctl(FD_VAL(state->vm_fd), KVM_SET_USER_MEMORY_REGION, &hw_reg) <
-	    0) {
-		pr_err("failed to flush hardware memory slot %u: %d\n",
-		       hw_reg.slot, errno);
-	} else {
-		pr_debug("successfully tore down hardware memory slot %u\n",
-			 hw_reg.slot);
-	}
 }
 
 /**
@@ -107,70 +71,51 @@ static void kvm_mem_region_unmap_cb(struct modvm_mem_space *space,
  *
  * Return: 0 on success, or a negative error code.
  */
-static int kvm_accel_init(struct modvm_accel *accel)
+static int kvm_accel_init(struct accel *accel)
 {
-	struct modvm_kvm_state *state;
+	struct kvm_state *state;
 	int raw_fd;
 	int ret;
 
+	ret = kvm_signal_init();
+	if (ret < 0)
+		return ret;
+
 	state = calloc(1, sizeof(*state));
 	if (!state)
-		return -ENOMEM;
+		return -VM_ENOMEM;
 
+	state->kvm_fd = INVALID_KVM_FD;
+	state->vm_fd = INVALID_VM_FD;
+	accel->priv = state;
 	raw_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
 	if (raw_fd < 0) {
+		ret = -host_error_from_errno(errno);
 		pr_err("failed to open hypervisor device node\n");
-		ret = -errno;
-		goto err_free_state;
+		return ret;
 	}
 	state->kvm_fd = TO_KVM_FD(raw_fd);
 
 	ret = ioctl(FD_VAL(state->kvm_fd), KVM_GET_API_VERSION, 0);
 	if (ret != KVM_API_VERSION) {
 		pr_err("unsupported hypervisor api version: %d\n", ret);
-		ret = -ENOTSUP;
-		goto err_close_kvm;
+		ret = -VM_ENOTSUP;
+		return ret;
 	}
 
 	raw_fd = ioctl(FD_VAL(state->kvm_fd), KVM_CREATE_VM, 0);
 	if (raw_fd < 0) {
+		ret = -host_error_from_errno(errno);
 		pr_err("failed to instantiate virtual machine container\n");
-		ret = -errno;
-		goto err_close_kvm;
+		return ret;
 	}
 	state->vm_fd = TO_VM_FD(raw_fd);
 
 	state->mem_slot_idx = TO_MEM_SLOT(0);
-	accel->priv = state;
 
-	ret = modvm_mem_space_init(&accel->mem_space, kvm_mem_region_map_cb,
-				   kvm_mem_region_unmap_cb, state);
-	if (ret < 0) {
-		pr_err("failed to initialize physical memory tracking\n");
-		goto err_close_vm;
-	}
-
-	atomic_init(&accel->is_running, false);
-
-	accel->init_mutex = os_mutex_create();
-	if (IS_ERR(accel->init_mutex)) {
-		pr_err("failed to allocate startup synchronization lock\n");
-		ret = PTR_ERR(accel->init_mutex);
-		accel->init_mutex = NULL;
-		modvm_mem_space_destroy(&accel->mem_space);
-		goto err_close_vm;
-	}
 
 	pr_info("acceleration container established successfully\n");
 	return 0;
-
-err_close_vm:
-	close(FD_VAL(state->vm_fd));
-err_close_kvm:
-	close(FD_VAL(state->kvm_fd));
-err_free_state:
-	free(state);
-	return ret;
 }
 
 /**
@@ -181,21 +126,21 @@ err_free_state:
  *
  * Return: 0 on success, or a negative error code.
  */
-static int kvm_accel_irqchip_setup(struct modvm_accel *accel)
+static int kvm_accel_irqchip_setup(struct accel *accel)
 {
 	struct kvm_pit_config pit_conf = { .flags = 0 };
-	struct modvm_kvm_state *state = accel->priv;
+	struct kvm_state *state = accel->priv;
 
 	if (ioctl(FD_VAL(state->vm_fd), KVM_CREATE_IRQCHIP, 0) < 0) {
-		pr_err("failed to synthesize architectural irqchip: %d\n",
-		       errno);
-		return -errno;
+		int error = host_error_from_errno(errno);
+		pr_err("failed to synthesize architectural irqchip: %d\n", error);
+		return -error;
 	}
 
 	if (ioctl(FD_VAL(state->vm_fd), KVM_CREATE_PIT2, &pit_conf) < 0) {
-		pr_err("failed to synthesize programmable interval timer: %d\n",
-		       errno);
-		return -errno;
+		int error = host_error_from_errno(errno);
+		pr_err("failed to synthesize programmable interval timer: %d\n", error);
+		return -error;
 	}
 
 	pr_info("architectural interrupt routing online\n");
@@ -206,21 +151,22 @@ static int kvm_accel_irqchip_setup(struct modvm_accel *accel)
  * kvm_accel_set_irq - inject a hardware interrupt signal
  * @accel: the acceleration context
  * @gsi: the Global System Interrupt number
- * @level: logical voltage level (1 for high, 0 for low)
+ * @level: interrupt level (0 deasserted, 1 asserted)
  *
  * Return: 0 on success, or a negative error code.
  */
-static int kvm_accel_set_irq(struct modvm_accel *accel, gsi_t gsi, int level)
+static int kvm_accel_set_irq(struct accel *accel, gsi_t gsi, int level)
 {
 	struct kvm_irq_level irq_level;
-	struct modvm_kvm_state *state = accel->priv;
+	struct kvm_state *state = accel->priv;
 
 	irq_level.irq = GSI_VAL(gsi);
 	irq_level.level = level;
 
 	if (ioctl(FD_VAL(state->vm_fd), KVM_IRQ_LINE, &irq_level) < 0) {
+		int error = host_error_from_errno(errno);
 		pr_err("failed to assert hardware irq line %u\n", GSI_VAL(gsi));
-		return -errno;
+		return -error;
 	}
 
 	return 0;
@@ -230,16 +176,12 @@ static int kvm_accel_set_irq(struct modvm_accel *accel, gsi_t gsi, int level)
  * kvm_accel_destroy - release host resources tied to the KVM subsystem
  * @accel: the acceleration context to tear down
  */
-static void kvm_accel_destroy(struct modvm_accel *accel)
+static void kvm_accel_destroy(struct accel *accel)
 {
-	struct modvm_kvm_state *state = accel->priv;
+	struct kvm_state *state = accel->priv;
 
-	if (accel->init_mutex) {
-		os_mutex_destroy(accel->init_mutex);
-		accel->init_mutex = NULL;
-	}
-
-	modvm_mem_space_destroy(&accel->mem_space);
+	if (!state)
+		return;
 	if (IS_VALID_FD(state->vm_fd))
 		close(FD_VAL(state->vm_fd));
 	if (IS_VALID_FD(state->kvm_fd))
@@ -248,20 +190,21 @@ static void kvm_accel_destroy(struct modvm_accel *accel)
 	accel->priv = NULL;
 }
 
-static const struct modvm_accel_ops kvm_ops = {
+static const struct accel_ops kvm_ops = {
 	.init = kvm_accel_init,
 	.destroy = kvm_accel_destroy,
+	.map_ram = kvm_accel_map_ram,
 	.setup_irqchip = kvm_accel_irqchip_setup,
 	.set_irq = kvm_accel_set_irq,
 };
 
-static const struct modvm_accel_backend kvm_backend = {
+static const struct accel_desc kvm_desc = {
 	.name = "kvm",
-	.ops = &kvm_ops,
-	.vcpu_ops = &modvm_kvm_vcpu_ops,
+	.accel_ops = &kvm_ops,
+	.vcpu_ops = &kvm_vcpu_ops,
 };
 
 static void __attribute__((constructor)) register_kvm_backend(void)
 {
-	modvm_accel_backend_register(&kvm_backend);
+	accel_register(&kvm_desc);
 }

@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/host/error.h>
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 
 #include <modvm/core/vcpu.h>
-#include <modvm/core/bus.h>
-#include <modvm/core/modvm.h>
-#include <modvm/internal/arch/x86/regs.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/types.h>
+#include <modvm/core/io_map.h>
+#include <modvm/core/vm.h>
+#include <modvm/arch/x86/regs.h>
+#include <modvm/util/log.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/types.h>
 
 #include "../internal.h"
 
@@ -21,16 +22,16 @@
 
 /**
  * kvm_x86_cpuid_setup - dynamically probe and inject host CPU features
- * @state: the global KVM state containing the hypervisor file descriptor
+ * @state: the VM KVM state containing the hypervisor file descriptor
  * @vcpu_fd: the file descriptor of the target virtual processor
+ * @vcpu_id: virtual processor index used for APIC and topology identity
  *
- * Utilizes an exponential backoff allocation strategy to retrieve the
- * full set of supported CPUID leaves from the host kernel, bypassing
- * hardcoded limits that cause failures on modern high-end processors.
+ * Reads supported CPUID leaves from KVM, doubling the entry array on E2BIG,
+ * then adjusts the advertised topology for this virtual processor.
  *
  * Return: 0 on success, or a negative error code.
  */
-static int kvm_x86_cpuid_setup(struct modvm_kvm_state *state, vcpu_fd_t vcpu_fd)
+static int kvm_x86_cpuid_setup(struct kvm_state *state, vcpu_fd_t vcpu_fd, unsigned int vcpu_id)
 {
 	struct kvm_cpuid2 *cpuid;
 	int nent = 100;
@@ -38,23 +39,21 @@ static int kvm_x86_cpuid_setup(struct modvm_kvm_state *state, vcpu_fd_t vcpu_fd)
 	int ret;
 
 	while (nent <= MAX_KVM_CPUID_ENTRIES) {
-		alloc_size =
-			sizeof(*cpuid) + nent * sizeof(struct kvm_cpuid_entry2);
+		alloc_size = sizeof(*cpuid) + nent * sizeof(struct kvm_cpuid_entry2);
 		cpuid = malloc(alloc_size);
 		if (!cpuid)
-			return -ENOMEM;
+			return -VM_ENOMEM;
 
 		cpuid->nent = nent;
-		ret = ioctl(FD_VAL(state->kvm_fd), KVM_GET_SUPPORTED_CPUID,
-			    cpuid);
+		ret = ioctl(FD_VAL(state->kvm_fd), KVM_GET_SUPPORTED_CPUID, cpuid);
 		if (ret == 0)
 			break;
 
-		ret = -errno;
+		ret = -host_error_from_errno(errno);
 		free(cpuid);
 
 		/* Array too small, scale up exponentially and retry */
-		if (ret == -E2BIG) {
+		if (ret == -VM_E2BIG) {
 			nent *= 2;
 			continue;
 		}
@@ -65,14 +64,46 @@ static int kvm_x86_cpuid_setup(struct modvm_kvm_state *state, vcpu_fd_t vcpu_fd)
 
 	if (nent > MAX_KVM_CPUID_ENTRIES) {
 		pr_err("kvm cpuid entries exceeded safe capacity limit\n");
-		return -E2BIG;
+		return -VM_E2BIG;
+	}
+
+	/* Flat topology: one thread and one core per virtual socket.
+	 * Do not expose the host's package/core counts to the guest.
+	 */
+	for (unsigned int i = 0; i < cpuid->nent; i++) {
+		struct kvm_cpuid_entry2 *entry = &cpuid->entries[i];
+		switch (entry->function) {
+		case 1:
+			entry->ebx = (entry->ebx & 0x0000ffff) | (1U << 16) | (vcpu_id << 24);
+			entry->edx &= ~(1U << 28); /* No SMT. */
+			break;
+		case 4:
+		case 0x8000001d:
+			/* One core/package; each cache is private to this vCPU. */
+			entry->eax &= 0x3fff;
+			break;
+		case 0xb:
+		case 0x1f:
+			entry->eax = 0;
+			entry->ebx = entry->index < 2 ? 1 : 0;
+			entry->ecx = entry->index | (entry->index < 2 ? (entry->index + 1) << 8 : 0);
+			entry->edx = vcpu_id;
+			break;
+		case 0x80000008:
+			entry->ecx &= ~0xf0ffU; /* One core, no intra-package ID bits. */
+			break;
+		case 0x8000001e:
+			entry->eax = vcpu_id;
+			entry->ebx = 0;
+			entry->ecx = 0;
+			break;
+		}
 	}
 
 	ret = ioctl(FD_VAL(vcpu_fd), KVM_SET_CPUID2, cpuid);
 	if (ret < 0) {
-		ret = -errno;
-		pr_err("failed to inject cpuid definitions into vcpu: %d\n",
-		       ret);
+		ret = -host_error_from_errno(errno);
+		pr_err("failed to inject cpuid definitions into vcpu: %d\n", ret);
 	}
 
 	free(cpuid);
@@ -80,7 +111,7 @@ static int kvm_x86_cpuid_setup(struct modvm_kvm_state *state, vcpu_fd_t vcpu_fd)
 }
 
 /**
- * modvm_kvm_arch_vcpu_init - initialize architecture specific vcpu state
+ * kvm_arch_vcpu_init - initialize architecture specific vcpu state
  * @vcpu: the virtual processor to initialize
  *
  * Encapsulates the configuration of legacy PC states such as CPUID matrices
@@ -88,13 +119,13 @@ static int kvm_x86_cpuid_setup(struct modvm_kvm_state *state, vcpu_fd_t vcpu_fd)
  *
  * Return: 0 on success, or a negative error code.
  */
-int modvm_kvm_arch_vcpu_init(struct modvm_vcpu *vcpu)
+int kvm_arch_vcpu_init(struct vcpu *vcpu)
 {
-	struct modvm_kvm_vcpu_state *vcpu_state = vcpu->priv;
-	struct modvm_kvm_state *state = vcpu->accel->priv;
+	struct kvm_vcpu_state *vcpu_state = vcpu->priv;
+	struct kvm_state *state = vcpu->accel->priv;
 	int ret;
 
-	ret = kvm_x86_cpuid_setup(state, vcpu_state->vcpu_fd);
+	ret = kvm_x86_cpuid_setup(state, vcpu_state->vcpu_fd, vcpu->id);
 	if (ret < 0)
 		return ret;
 
@@ -103,15 +134,11 @@ int modvm_kvm_arch_vcpu_init(struct modvm_vcpu *vcpu)
 	 * waiting for the Bootstrap Processor (BSP) to send SIPI IPIs.
 	 */
 	if (vcpu->id > 0) {
-		struct kvm_mp_state mp_state = {
-			.mp_state = KVM_MP_STATE_UNINITIALIZED
-		};
+		struct kvm_mp_state mp_state = { .mp_state = KVM_MP_STATE_UNINITIALIZED };
 
-		if (ioctl(FD_VAL(vcpu_state->vcpu_fd), KVM_SET_MP_STATE,
-			  &mp_state) < 0) {
-			ret = -errno;
-			pr_err("failed to set architectural power state for ap %d: %d\n",
-			       vcpu->id, ret);
+		if (ioctl(FD_VAL(vcpu_state->vcpu_fd), KVM_SET_MP_STATE, &mp_state) < 0) {
+			ret = -host_error_from_errno(errno);
+			pr_err("failed to set architectural power state for ap %d: %d\n", vcpu->id, ret);
 			return ret;
 		}
 	}
@@ -119,8 +146,7 @@ int modvm_kvm_arch_vcpu_init(struct modvm_vcpu *vcpu)
 	return 0;
 }
 
-static void kvm_x86_segment_pack(struct kvm_segment *dst,
-				 const struct modvm_x86_segment *src)
+static void kvm_x86_segment_pack(struct kvm_segment *dst, const struct x86_segment *src)
 {
 	dst->base = src->base;
 	dst->limit = src->limit;
@@ -135,8 +161,7 @@ static void kvm_x86_segment_pack(struct kvm_segment *dst,
 	dst->unusable = src->unusable;
 }
 
-static void kvm_x86_segment_unpack(struct modvm_x86_segment *dst,
-				   const struct kvm_segment *src)
+static void kvm_x86_segment_unpack(struct x86_segment *dst, const struct kvm_segment *src)
 {
 	dst->base = src->base;
 	dst->limit = src->limit;
@@ -152,7 +177,7 @@ static void kvm_x86_segment_unpack(struct modvm_x86_segment *dst,
 }
 
 /**
- * modvm_kvm_arch_vcpu_get_regs - fetch x86 architectural state from KVM
+ * kvm_arch_vcpu_get_regs - fetch x86 architectural state from KVM
  * @vcpu: the virtual processor
  * @reg_class: identifier specifying GPRs or Special Registers
  * @buf: destination buffer
@@ -160,21 +185,19 @@ static void kvm_x86_segment_unpack(struct modvm_x86_segment *dst,
  *
  * Return: 0 on success, or a negative error code.
  */
-int modvm_kvm_arch_vcpu_get_regs(struct modvm_vcpu *vcpu,
-				 enum modvm_reg_class reg_class, void *buf,
-				 size_t size)
+int kvm_arch_vcpu_get_regs(struct vcpu *vcpu, enum reg_class reg_class, void *buf, size_t size)
 {
-	struct modvm_kvm_vcpu_state *state = vcpu->priv;
+	struct kvm_vcpu_state *state = vcpu->priv;
 
-	if (reg_class == MODVM_REG_SREGS) {
+	if (reg_class == REG_SREGS) {
 		struct kvm_sregs k_sregs;
-		struct modvm_x86_sregs *m_sregs = buf;
+		struct x86_sregs *m_sregs = buf;
 
 		if (WARN_ON(size != sizeof(*m_sregs)))
-			return -EINVAL;
+			return -VM_EINVAL;
 
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_GET_SREGS, &k_sregs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 
 		kvm_x86_segment_unpack(&m_sregs->cs, &k_sregs.cs);
 		kvm_x86_segment_unpack(&m_sregs->ds, &k_sregs.ds);
@@ -195,15 +218,15 @@ int modvm_kvm_arch_vcpu_get_regs(struct modvm_vcpu *vcpu,
 		return 0;
 	}
 
-	if (reg_class == MODVM_REG_GPR) {
+	if (reg_class == REG_GPR) {
 		struct kvm_regs k_regs;
-		struct modvm_x86_regs *m_regs = buf;
+		struct x86_regs *m_regs = buf;
 
 		if (WARN_ON(size != sizeof(*m_regs)))
-			return -EINVAL;
+			return -VM_EINVAL;
 
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_GET_REGS, &k_regs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 
 		m_regs->rax = k_regs.rax;
 		m_regs->rbx = k_regs.rbx;
@@ -226,11 +249,11 @@ int modvm_kvm_arch_vcpu_get_regs(struct modvm_vcpu *vcpu,
 		return 0;
 	}
 
-	return -ENOTSUP;
+	return -VM_ENOTSUP;
 }
 
 /**
- * modvm_kvm_arch_vcpu_set_regs - commit x86 architectural state to KVM
+ * kvm_arch_vcpu_set_regs - commit x86 architectural state to KVM
  * @vcpu: the virtual processor
  * @reg_class: identifier specifying GPRs or Special Registers
  * @buf: source buffer
@@ -238,22 +261,20 @@ int modvm_kvm_arch_vcpu_get_regs(struct modvm_vcpu *vcpu,
  *
  * Return: 0 on success, or a negative error code.
  */
-int modvm_kvm_arch_vcpu_set_regs(struct modvm_vcpu *vcpu,
-				 enum modvm_reg_class reg_class,
-				 const void *buf, size_t size)
+int kvm_arch_vcpu_set_regs(struct vcpu *vcpu, enum reg_class reg_class, const void *buf, size_t size)
 {
-	struct modvm_kvm_vcpu_state *state = vcpu->priv;
+	struct kvm_vcpu_state *state = vcpu->priv;
 
-	if (reg_class == MODVM_REG_SREGS) {
+	if (reg_class == REG_SREGS) {
 		struct kvm_sregs k_sregs;
-		const struct modvm_x86_sregs *m_sregs = buf;
+		const struct x86_sregs *m_sregs = buf;
 
 		if (WARN_ON(size != sizeof(*m_sregs)))
-			return -EINVAL;
+			return -VM_EINVAL;
 
 		/* Fetch existing state to preserve unmapped fields like interrupt bitmaps */
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_GET_SREGS, &k_sregs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 
 		kvm_x86_segment_pack(&k_sregs.cs, &m_sregs->cs);
 		kvm_x86_segment_pack(&k_sregs.ds, &m_sregs->ds);
@@ -273,16 +294,16 @@ int modvm_kvm_arch_vcpu_set_regs(struct modvm_vcpu *vcpu,
 		k_sregs.apic_base = m_sregs->apic_base;
 
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_SET_SREGS, &k_sregs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 		return 0;
 	}
 
-	if (reg_class == MODVM_REG_GPR) {
+	if (reg_class == REG_GPR) {
 		struct kvm_regs k_regs;
-		const struct modvm_x86_regs *m_regs = buf;
+		const struct x86_regs *m_regs = buf;
 
 		if (WARN_ON(size != sizeof(*m_regs)))
-			return -EINVAL;
+			return -VM_EINVAL;
 
 		memset(&k_regs, 0, sizeof(k_regs));
 		k_regs.rax = m_regs->rax;
@@ -305,176 +326,173 @@ int modvm_kvm_arch_vcpu_set_regs(struct modvm_vcpu *vcpu,
 		k_regs.rflags = m_regs->rflags;
 
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_SET_REGS, &k_regs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 		return 0;
 	}
 
-	return -ENOTSUP;
+	return -VM_ENOTSUP;
 }
 
-int modvm_kvm_arch_vcpu_get_reg(struct modvm_vcpu *vcpu, uint64_t reg_id,
-				uint64_t *val)
+int kvm_arch_vcpu_get_reg(struct vcpu *vcpu, uint64_t reg_id, uint64_t *val)
 {
-	struct modvm_kvm_vcpu_state *state = vcpu->priv;
+	struct kvm_vcpu_state *state = vcpu->priv;
 	struct kvm_regs k_regs;
 
-	if (reg_id <= MODVM_X86_REG_RFLAGS) {
+	if (reg_id <= X86_REG_RFLAGS) {
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_GET_REGS, &k_regs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 
 		switch (reg_id) {
-		case MODVM_X86_REG_RAX:
+		case X86_REG_RAX:
 			*val = k_regs.rax;
 			break;
-		case MODVM_X86_REG_RBX:
+		case X86_REG_RBX:
 			*val = k_regs.rbx;
 			break;
-		case MODVM_X86_REG_RCX:
+		case X86_REG_RCX:
 			*val = k_regs.rcx;
 			break;
-		case MODVM_X86_REG_RDX:
+		case X86_REG_RDX:
 			*val = k_regs.rdx;
 			break;
-		case MODVM_X86_REG_RSI:
+		case X86_REG_RSI:
 			*val = k_regs.rsi;
 			break;
-		case MODVM_X86_REG_RDI:
+		case X86_REG_RDI:
 			*val = k_regs.rdi;
 			break;
-		case MODVM_X86_REG_RSP:
+		case X86_REG_RSP:
 			*val = k_regs.rsp;
 			break;
-		case MODVM_X86_REG_RBP:
+		case X86_REG_RBP:
 			*val = k_regs.rbp;
 			break;
-		case MODVM_X86_REG_R8:
+		case X86_REG_R8:
 			*val = k_regs.r8;
 			break;
-		case MODVM_X86_REG_R9:
+		case X86_REG_R9:
 			*val = k_regs.r9;
 			break;
-		case MODVM_X86_REG_R10:
+		case X86_REG_R10:
 			*val = k_regs.r10;
 			break;
-		case MODVM_X86_REG_R11:
+		case X86_REG_R11:
 			*val = k_regs.r11;
 			break;
-		case MODVM_X86_REG_R12:
+		case X86_REG_R12:
 			*val = k_regs.r12;
 			break;
-		case MODVM_X86_REG_R13:
+		case X86_REG_R13:
 			*val = k_regs.r13;
 			break;
-		case MODVM_X86_REG_R14:
+		case X86_REG_R14:
 			*val = k_regs.r14;
 			break;
-		case MODVM_X86_REG_R15:
+		case X86_REG_R15:
 			*val = k_regs.r15;
 			break;
-		case MODVM_X86_REG_RIP:
+		case X86_REG_RIP:
 			*val = k_regs.rip;
 			break;
-		case MODVM_X86_REG_RFLAGS:
+		case X86_REG_RFLAGS:
 			*val = k_regs.rflags;
 			break;
 		default:
-			return -EINVAL;
+			return -VM_EINVAL;
 		}
 		return 0;
 	}
-	return -ENOTSUP;
+	return -VM_ENOTSUP;
 }
 
-int modvm_kvm_arch_vcpu_set_reg(struct modvm_vcpu *vcpu, uint64_t reg_id,
-				uint64_t val)
+int kvm_arch_vcpu_set_reg(struct vcpu *vcpu, uint64_t reg_id, uint64_t val)
 {
-	struct modvm_kvm_vcpu_state *state = vcpu->priv;
+	struct kvm_vcpu_state *state = vcpu->priv;
 	struct kvm_regs k_regs;
 
-	if (reg_id <= MODVM_X86_REG_RFLAGS) {
+	if (reg_id <= X86_REG_RFLAGS) {
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_GET_REGS, &k_regs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 
 		switch (reg_id) {
-		case MODVM_X86_REG_RAX:
+		case X86_REG_RAX:
 			k_regs.rax = val;
 			break;
-		case MODVM_X86_REG_RBX:
+		case X86_REG_RBX:
 			k_regs.rbx = val;
 			break;
-		case MODVM_X86_REG_RCX:
+		case X86_REG_RCX:
 			k_regs.rcx = val;
 			break;
-		case MODVM_X86_REG_RDX:
+		case X86_REG_RDX:
 			k_regs.rdx = val;
 			break;
-		case MODVM_X86_REG_RSI:
+		case X86_REG_RSI:
 			k_regs.rsi = val;
 			break;
-		case MODVM_X86_REG_RDI:
+		case X86_REG_RDI:
 			k_regs.rdi = val;
 			break;
-		case MODVM_X86_REG_RSP:
+		case X86_REG_RSP:
 			k_regs.rsp = val;
 			break;
-		case MODVM_X86_REG_RBP:
+		case X86_REG_RBP:
 			k_regs.rbp = val;
 			break;
-		case MODVM_X86_REG_R8:
+		case X86_REG_R8:
 			k_regs.r8 = val;
 			break;
-		case MODVM_X86_REG_R9:
+		case X86_REG_R9:
 			k_regs.r9 = val;
 			break;
-		case MODVM_X86_REG_R10:
+		case X86_REG_R10:
 			k_regs.r10 = val;
 			break;
-		case MODVM_X86_REG_R11:
+		case X86_REG_R11:
 			k_regs.r11 = val;
 			break;
-		case MODVM_X86_REG_R12:
+		case X86_REG_R12:
 			k_regs.r12 = val;
 			break;
-		case MODVM_X86_REG_R13:
+		case X86_REG_R13:
 			k_regs.r13 = val;
 			break;
-		case MODVM_X86_REG_R14:
+		case X86_REG_R14:
 			k_regs.r14 = val;
 			break;
-		case MODVM_X86_REG_R15:
+		case X86_REG_R15:
 			k_regs.r15 = val;
 			break;
-		case MODVM_X86_REG_RIP:
+		case X86_REG_RIP:
 			k_regs.rip = val;
 			break;
-		case MODVM_X86_REG_RFLAGS:
+		case X86_REG_RFLAGS:
 			k_regs.rflags = val;
 			break;
 		default:
-			return -EINVAL;
+			return -VM_EINVAL;
 		}
 
 		if (ioctl(FD_VAL(state->vcpu_fd), KVM_SET_REGS, &k_regs) < 0)
-			return -errno;
+			return -host_error_from_errno(errno);
 		return 0;
 	}
-	return -ENOTSUP;
+	return -VM_ENOTSUP;
 }
 
 /**
- * modvm_kvm_arch_vcpu_handle_exit - handle architecture-specific traps
+ * kvm_arch_vcpu_handle_exit - handle architecture-specific traps
  * @vcpu: the virtual processor
  * @run: the shared kvm_run communication structure
  *
  * Processes x86 legacy Port I/O instructions (IN/OUT) by routing them
- * to the global PIO bus architecture.
+ * to the owning VM port I/O mappings.
  *
  * Return: 0 to resume execution, or a negative error code to abort.
  */
-int modvm_kvm_arch_vcpu_handle_exit(struct modvm_vcpu *vcpu,
-				    struct kvm_run *run)
+int kvm_arch_vcpu_handle_exit(struct vcpu *vcpu, struct kvm_run *run)
 {
-	struct modvm_bus *bus = vcpu->accel->bus;
+	struct io_map *io_map = vcpu->accel->io_map;
 	uint16_t port;
 	uint8_t size;
 	uint32_t count;
@@ -504,12 +522,9 @@ int modvm_kvm_arch_vcpu_handle_exit(struct modvm_vcpu *vcpu,
 					break;
 				}
 
-				modvm_bus_dispatch_write(bus, MODVM_BUS_PIO,
-							 TO_GPA(port), val,
-							 size);
+				io_map_write(io_map, IO_PIO, TO_GPA(port), val, size);
 			} else {
-				uint64_t val = modvm_bus_dispatch_read(
-					bus, MODVM_BUS_PIO, TO_GPA(port), size);
+				uint64_t val = io_map_read(io_map, IO_PIO, TO_GPA(port), size);
 
 				switch (size) {
 				case 1:
@@ -528,13 +543,11 @@ int modvm_kvm_arch_vcpu_handle_exit(struct modvm_vcpu *vcpu,
 		return 0;
 
 	case KVM_EXIT_SHUTDOWN:
-		pr_err("vcpu %d triggered a fatal triple fault hardware shutdown\n",
-		       vcpu->id);
-		return -EFAULT;
+		pr_err("vcpu %d triggered a fatal triple fault hardware shutdown\n", vcpu->id);
+		return -VM_EFAULT;
 
 	default:
-		pr_warn("unhandled architectural exit reason: %d\n",
-			run->exit_reason);
-		return -ENOTSUP;
+		pr_warn("unhandled architectural exit reason: %d\n", run->exit_reason);
+		return -VM_ENOTSUP;
 	}
 }

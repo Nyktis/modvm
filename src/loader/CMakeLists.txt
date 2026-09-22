@@ -1,0 +1,7 @@
+add_library(modvm_loader OBJECT image.c)
+modvm_module_headers(modvm_loader core io host util arch)
+if(MODVM_GUEST_ARCH STREQUAL "x86_64")
+    target_sources(modvm_loader PRIVATE linux_x86.c raw_x86.c)
+else()
+    message(FATAL_ERROR "No loaders for guest architecture: ${MODVM_GUEST_ARCH}")
+endif()

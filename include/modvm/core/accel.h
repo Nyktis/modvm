@@ -2,67 +2,69 @@
 #ifndef MODVM_CORE_ACCEL_H
 #define MODVM_CORE_ACCEL_H
 
+#include <modvm/errno.h>
 #include <stdatomic.h>
-#include <modvm/core/memory.h>
-#include <modvm/os/thread.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/types.h>
 
-struct modvm_accel;
-struct modvm_vcpu_ops;
+struct mem_region;
+struct accel;
+struct vcpu_ops;
 
 /**
- * struct modvm_accel_ops - hardware accelerator backend operations
+ * struct accel_ops - hardware accelerator backend operations
  * @init: initialize the hardware acceleration context
- * @destroy: release hardware acceleration resources
+ * @destroy: ends accelerator lifetime and frees private resources
+ * @map_ram: optional RAM registration; returns 0 or negative project error
  * @setup_irqchip: synthesize the architectural interrupt controller
  * @set_irq: assert or deassert a specific hardware interrupt line
  */
-struct modvm_accel_ops {
-	int (*init)(struct modvm_accel *accel);
-	void (*destroy)(struct modvm_accel *accel);
-	int (*setup_irqchip)(struct modvm_accel *accel);
-	int (*set_irq)(struct modvm_accel *accel, gsi_t gsi, int level);
+/* init/destroy are mandatory. destroy handles partial init and releases all
+ * native RAM references before returning. map_ram borrows the region and backing
+ * until destroy; on failure it retains neither. Missing map_ram rejects RAM
+ * creation with -VM_ENOTSUP. IRQ operations are also optional. */
+struct accel_ops {
+	int (*init)(struct accel *accel);
+	void (*destroy)(struct accel *accel);
+	int (*map_ram)(struct accel *accel, const struct mem_region *region);
+	int (*setup_irqchip)(struct accel *accel);
+	int (*set_irq)(struct accel *accel, gsi_t gsi, int level);
 };
 
 /**
- * struct modvm_accel_backend - blueprint for an acceleration backend
- * @name: the unique string identifier (e.g., "kvm")
- * @ops: pointer to the backend operations table
+ * struct accel_desc - acceleration backend description
+ * @name: name unique within the accelerator registry (e.g., "kvm")
+ * @accel_ops: pointer to the acceleration operations table
  * @vcpu_ops: virtual processor operations associated with this backend
  */
-struct modvm_accel_backend {
+struct accel_desc {
 	const char *name;
-	const struct modvm_accel_ops *ops;
-	const struct modvm_vcpu_ops *vcpu_ops;
+	const struct accel_ops *accel_ops;
+	const struct vcpu_ops *vcpu_ops;
 };
 
 /**
- * struct modvm_accel - the virtualization engine context
- * @backend: the blueprint of the selected acceleration backend
- * @mem_space: physical memory controller managing guest mappings
- * @bus: system bus topology for routing exits
+ * struct accel - per-VM acceleration state
+ * @desc: description of the selected acceleration backend
+ * @io_map: guest device mappings for routing MMIO/PIO exits
  * @priv: opaque pointer to the underlying accelerator state
- * @is_running: thread-safe power state monitored by all executing processors
- * @init_mutex: synchronization lock for virtual processor startup phase
+ * @stop_requested: borrowed VM stop flag; accelerator may read but never reset it
  */
-struct modvm_accel {
-	const struct modvm_accel_backend *backend;
-	struct modvm_mem_space mem_space;
-	struct modvm_bus *bus;
+struct accel {
+	const struct accel_desc *desc;
+	struct io_map *io_map;
 	void *priv;
-	atomic_bool is_running;
-	struct os_mutex *init_mutex;
+	const atomic_bool *stop_requested;
 };
 
-void modvm_accel_backend_register(const struct modvm_accel_backend *backend);
-const struct modvm_accel_backend *modvm_accel_backend_find(const char *name);
+/* Startup-only registration; invalid, duplicate or excess entries are fatal programming errors. */
+void accel_register(const struct accel_desc *desc);
+const struct accel_desc *accel_find(const char *name);
 
-int modvm_accel_init(struct modvm_accel *accel, const char *name,
-		     struct modvm_bus *bus);
-int modvm_accel_setup_irqchip(struct modvm_accel *accel);
-int modvm_accel_set_irq(struct modvm_accel *accel, gsi_t gsi, int level);
-int modvm_accel_map_ram(struct modvm_accel *accel, gpa_t gpa, size_t size,
-			uint32_t flags);
-void modvm_accel_destroy(struct modvm_accel *accel);
+/* The owner registers destruction before init. Published private state remains
+ * owned on failure and is released by destroy, not by the failed init path. */
+int accel_init(struct accel *accel, const char *name, struct io_map *io_map, const atomic_bool *stop_requested);
+int accel_setup_irqchip(struct accel *accel);
+int accel_set_irq(struct accel *accel, gsi_t gsi, int level);
+void accel_destroy(struct accel *accel);
 
 #endif /* MODVM_CORE_ACCEL_H */

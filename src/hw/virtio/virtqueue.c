@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/errno.h>
 #include <stdlib.h>
-#include <errno.h>
+#include <string.h>
 #include <stdatomic.h>
 
 #include <modvm/core/memory.h>
-#include <modvm/utils/byteorder.h>
-#include <modvm/utils/compiler.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/err.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/byteorder.h>
+#include <modvm/util/compiler.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/err.h>
+#include <modvm/util/types.h>
 
 #include "virtqueue.h"
 
@@ -32,22 +33,30 @@ struct vring_used {
 /**
  * struct virtqueue - internal representation of a virtio ring
  * @mem: reference to the virtual machine physical memory space
- * @queue_size: maximum number of descriptors
+ * @queue_size: current guest-selected ring size
+ * @max_size: device-advertised maximum descriptor count
+ * @broken: chain validation failed; requires reset before reuse
+ * @enabled: ring mappings are enabled; device readiness is checked separately
  * @last_avail_idx: host-side cached index of the next available buffer
  * @last_used_idx: host-side cached index of the next used buffer
  * @desc_table: mapped host virtual address of the descriptor table
  * @avail_ring: mapped host virtual address of the available ring
  * @used_ring: mapped host virtual address of the used ring
+ * @bufs: one descriptor snapshot per slot; storage borrowed by the current chain
  */
 struct virtqueue {
-	struct modvm_mem_space *mem;
+	struct mem_space *mem;
 	uint16_t queue_size;
+	uint16_t max_size;
+	bool broken;
+	bool enabled;
 	uint16_t last_avail_idx;
 	uint16_t last_used_idx;
 
 	struct vring_desc *desc_table;
 	struct vring_avail *avail_ring;
 	struct vring_used *used_ring;
+	struct virtqueue_buf bufs[];
 };
 
 /**
@@ -57,8 +66,7 @@ struct virtqueue {
  *
  * Return: allocated virtqueue, or NULL on failure.
  */
-struct virtqueue *virtqueue_create(struct modvm_mem_space *mem,
-				   uint16_t queue_size)
+struct virtqueue *virtqueue_create(struct mem_space *mem, uint16_t queue_size)
 {
 	struct virtqueue *vq;
 
@@ -68,12 +76,13 @@ struct virtqueue *virtqueue_create(struct modvm_mem_space *mem,
 	if (WARN_ON((queue_size & (queue_size - 1)) != 0))
 		return NULL;
 
-	vq = calloc(1, sizeof(*vq));
+	vq = calloc(1, sizeof(*vq) + queue_size * sizeof(vq->bufs[0]));
 	if (!vq)
 		return NULL;
 
 	vq->mem = mem;
 	vq->queue_size = queue_size;
+	vq->max_size = queue_size;
 	vq->last_avail_idx = 0;
 	vq->last_used_idx = 0;
 
@@ -81,17 +90,36 @@ struct virtqueue *virtqueue_create(struct modvm_mem_space *mem,
 }
 
 /**
- * virtqueue_get_size - retrieve the configured maximum depth of the queue
+ * virtqueue_get_max_size - retrieve the configured maximum depth of the queue
  * @vq: the virtqueue instance
  *
  * Return: number of descriptors the queue can hold, or 0 if invalid.
  */
-uint16_t virtqueue_get_size(struct virtqueue *vq)
+uint16_t virtqueue_get_max_size(struct virtqueue *vq)
 {
 	if (WARN_ON(!vq))
 		return 0;
 
-	return vq->queue_size;
+	return vq->max_size;
+}
+
+int virtqueue_set_size(struct virtqueue *vq, uint16_t size)
+{
+	if (vq->enabled || !size || (size & (size - 1)) || size > vq->max_size)
+		return -VM_EINVAL;
+	vq->queue_size = size;
+	return 0;
+}
+
+void virtqueue_reset(struct virtqueue *vq)
+{
+	vq->enabled = false;
+	vq->broken = false;
+	vq->queue_size = vq->max_size;
+	vq->last_avail_idx = vq->last_used_idx = 0;
+	vq->desc_table = NULL;
+	vq->avail_ring = NULL;
+	vq->used_ring = NULL;
 }
 
 /**
@@ -103,108 +131,139 @@ uint16_t virtqueue_get_size(struct virtqueue *vq)
  *
  * Return: 0 on success, or a negative error code.
  */
-int virtqueue_set_addrs(struct virtqueue *vq, gpa_t desc_gpa, gpa_t avail_gpa,
-			gpa_t used_gpa)
+int virtqueue_set_addrs(struct virtqueue *vq, gpa_t desc_gpa, gpa_t avail_gpa, gpa_t used_gpa)
 {
 	if (WARN_ON(!vq))
-		return -EINVAL;
+		return -VM_EINVAL;
 
-	vq->desc_table = modvm_mem_gpa_to_hva(vq->mem, desc_gpa);
-	vq->avail_ring = modvm_mem_gpa_to_hva(vq->mem, avail_gpa);
-	vq->used_ring = modvm_mem_gpa_to_hva(vq->mem, used_gpa);
-
-	if (!vq->desc_table || !vq->avail_ring || !vq->used_ring)
-		return -EFAULT;
+	if ((GPA_VAL(desc_gpa) & 15) || (GPA_VAL(avail_gpa) & 1) || (GPA_VAL(used_gpa) & 3))
+		return -VM_EINVAL;
+	void *desc = mem_map_range(vq->mem, desc_gpa, 16u * vq->queue_size, false);
+	void *avail = mem_map_range(vq->mem, avail_gpa, 6u + 2u * vq->queue_size, false);
+	void *used = mem_map_range(vq->mem, used_gpa, 6u + 8u * vq->queue_size, true);
+	if (!desc || !avail || !used)
+		return -VM_EFAULT;
+	vq->desc_table = desc;
+	vq->avail_ring = avail;
+	vq->used_ring = used;
+	vq->enabled = true;
 
 	return 0;
 }
 
-/**
- * virtqueue_pop - fetch the next pending buffer chain from the guest
- * @vq: the virtqueue instance
- * @out_desc_idx: pointer to accept the head descriptor index
- * @bufs: array to populate with translated host pointers
- * @max_bufs: maximum capacity of the provided array
- *
- * This function resides on the hot path and processes I/O rings dynamically.
- * It incorporates a robust scatter-gather splitting mechanism to securely
- * handle guest DMA descriptors that span across disjoint physical memory regions.
- *
- * Return: number of buffers populated, 0 if empty, or a negative error code.
- */
-int virtqueue_pop(struct virtqueue *vq, uint16_t *out_desc_idx,
-		  struct virtqueue_buf *bufs, int max_bufs)
+void virtqueue_disable(struct virtqueue *vq)
 {
-	uint16_t avail_idx;
-	uint16_t head_idx;
-	uint16_t current_idx;
-	int num_bufs = 0;
+	vq->enabled = false;
+}
 
-	if (unlikely(!vq || !vq->avail_ring || !vq->desc_table))
-		return -EINVAL;
-
-	avail_idx = le16_to_cpu(vq->avail_ring->idx);
-	atomic_thread_fence(memory_order_acquire);
-
-	if (unlikely(vq->last_avail_idx == avail_idx))
+int virtqueue_pop(struct virtqueue *vq, struct virtqueue_chain *chain)
+{
+	if (!vq || !chain)
+		return -VM_EINVAL;
+	*chain = (struct virtqueue_chain){ .mem = vq->mem, .bufs = vq->bufs };
+	if (!vq->enabled)
 		return 0;
-
-	head_idx = le16_to_cpu(
-		vq->avail_ring->ring[vq->last_avail_idx % vq->queue_size]);
-
-	if (unlikely(head_idx >= vq->queue_size))
-		return -EFAULT;
-
-	*out_desc_idx = head_idx;
-	current_idx = head_idx;
-
-	do {
-		struct vring_desc *desc = &vq->desc_table[current_idx];
-		gpa_t gpa = TO_GPA(le64_to_cpu(desc->addr));
-		uint32_t len = le32_to_cpu(desc->len);
-		bool is_write =
-			(le16_to_cpu(desc->flags) & VRING_DESC_F_WRITE) != 0;
-
-		/*
-		 * A single guest descriptor might cross a physical memory region
-		 * boundary (e.g., spanning across the PCI hole). We must slice
-		 * it into multiple contiguous host virtual buffers.
-		 */
-		while (len > 0) {
-			size_t chunk_len;
-			void *hva;
-
-			if (unlikely(num_bufs >= max_bufs))
-				return -ENOSPC;
-
-			hva = modvm_mem_gpa_to_hva_clamp(vq->mem, gpa, len,
-							 &chunk_len);
-			if (unlikely(!hva)) {
-				pr_err("virtio trap: malicious or unmapped gpa 0x%llx\n",
-				       (unsigned long long)GPA_VAL(gpa));
-				return -EFAULT;
-			}
-
-			bufs[num_bufs].hva = hva;
-			bufs[num_bufs].len = (uint32_t)chunk_len;
-			bufs[num_bufs].is_write = is_write;
-			num_bufs++;
-
-			gpa = gpa_add(gpa, chunk_len);
-			len -= chunk_len;
+	if (vq->broken)
+		return -VM_EIO;
+	uint16_t available = le16_to_cpu(vq->avail_ring->idx);
+	atomic_thread_fence(memory_order_acquire);
+	if (available == vq->last_avail_idx)
+		return 0;
+	int error = -VM_EFAULT;
+	if ((uint16_t)(available - vq->last_avail_idx) > vq->queue_size)
+		goto fail;
+	uint16_t index = le16_to_cpu(vq->avail_ring->ring[vq->last_avail_idx % vq->queue_size]);
+	chain->head = index;
+	bool writable = false;
+	for (;;) {
+		if (index >= vq->queue_size)
+			goto fail;
+		if (chain->nr_bufs == vq->queue_size) {
+			error = -VM_ELOOP;
+			goto fail;
 		}
-
-		if (!(le16_to_cpu(desc->flags) & VRING_DESC_F_NEXT))
+		struct vring_desc desc;
+		memcpy(&desc, &vq->desc_table[index], sizeof(desc));
+		uint16_t flags = le16_to_cpu(desc.flags);
+		bool write = !!(flags & VRING_DESC_F_WRITE);
+		if ((flags & ~(VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)) || (writable && !write)) {
+			error = -VM_EINVAL;
+			goto fail;
+		}
+		writable |= write;
+		gpa_t gpa = TO_GPA(le64_to_cpu(desc.addr));
+		size_t length = le32_to_cpu(desc.len);
+		size_t *total = write ? &chain->writable : &chain->readable;
+		if (length > UINT64_MAX - GPA_VAL(gpa) || length > SIZE_MAX - *total)
+			goto fail;
+		*total += length;
+		vq->bufs[chain->nr_bufs++] = (struct virtqueue_buf){ .gpa = gpa, .len = length, .is_write = write };
+		while (length) {
+			size_t chunk;
+			if (!mem_map_chunk(vq->mem, gpa, length, write, &chunk) || !chunk)
+				goto fail;
+			gpa = gpa_add(gpa, chunk);
+			length -= chunk;
+		}
+		if (!(flags & VRING_DESC_F_NEXT))
 			break;
-
-		current_idx = le16_to_cpu(desc->next);
-		if (unlikely(current_idx >= vq->queue_size))
-			return -EFAULT;
-
-	} while (true);
-
+		index = le16_to_cpu(desc.next);
+	}
 	vq->last_avail_idx++;
-	return num_bufs;
+	return 1;
+fail:
+	vq->broken = true;
+	return error;
+}
+
+void *virtqueue_map(const struct virtqueue_chain *chain, bool write, size_t offset, size_t *length)
+{
+	for (unsigned i = 0; i < chain->nr_bufs; i++) {
+		const struct virtqueue_buf *buf = &chain->bufs[i];
+		if (buf->is_write != write)
+			continue;
+		if (offset >= buf->len) {
+			offset -= buf->len;
+			continue;
+		}
+		return mem_map_chunk(chain->mem, gpa_add(buf->gpa, offset), buf->len - offset, write, length);
+	}
+	*length = 0;
+	return NULL;
+}
+
+static int virtqueue_copy(const struct virtqueue_chain *chain, bool write, size_t offset, void *data, size_t size)
+{
+	size_t capacity = write ? chain->writable : chain->readable;
+	if (offset > capacity || size > capacity - offset)
+		return -VM_EINVAL;
+	uint8_t *bytes = data;
+	while (size) {
+		size_t chunk;
+		void *hva = virtqueue_map(chain, write, offset, &chunk);
+		if (!hva || !chunk)
+			return -VM_EFAULT;
+		if (chunk > size)
+			chunk = size;
+		if (write)
+			memcpy(hva, bytes, chunk);
+		else
+			memcpy(bytes, hva, chunk);
+		bytes += chunk;
+		offset += chunk;
+		size -= chunk;
+	}
+	return 0;
+}
+
+int virtqueue_read(const struct virtqueue_chain *chain, size_t offset, void *data, size_t size)
+{
+	return virtqueue_copy(chain, false, offset, data, size);
+}
+
+int virtqueue_write(const struct virtqueue_chain *chain, size_t offset, const void *data, size_t size)
+{
+	return virtqueue_copy(chain, true, offset, (void *)data, size);
 }
 
 /**
@@ -218,7 +277,7 @@ void virtqueue_push(struct virtqueue *vq, uint16_t desc_idx, uint32_t len)
 	struct vring_used_elem *used_elem;
 	uint16_t ring_idx;
 
-	if (unlikely(!vq || !vq->used_ring))
+	if (unlikely(!vq || !vq->enabled || !vq->used_ring))
 		return;
 
 	ring_idx = vq->last_used_idx % vq->queue_size;

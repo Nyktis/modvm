@@ -1,52 +1,45 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <stdlib.h>
-#include <errno.h>
 
 #include <modvm/core/irq.h>
-#include <modvm/core/devm.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/compiler.h>
+#include <modvm/util/res_pool.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/compiler.h>
 
-struct modvm_irq {
-	modvm_irq_cb_t cb;
+struct irq {
+	irq_cb_t cb;
 	void *data;
 };
 
 /**
- * modvm_devm_irq_alloc - allocate a device-managed interrupt line
- * @dev: the device to manage this interrupt's lifecycle
- * @cb: the function to invoke upon state change
+ * irq_alloc - allocate a resource-pool-owned interrupt line
+ * @pool: the resource pool to manage this interrupt's lifecycle
+ * @cb: the function to invoke for each level request
  * @data: contextual closure payload
  *
- * The allocated IRQ line will be automatically freed when the device
- * is destroyed via modvm_device_put.
+ * The allocated IRQ line is freed when pool is released. Its callback data
+ * must remain valid until the last level request has completed.
  *
  * Return: allocated interrupt line, or NULL on failure.
  */
-struct modvm_irq *modvm_devm_irq_alloc(struct modvm_device *dev,
-				       modvm_irq_cb_t cb, void *data)
+struct irq *irq_alloc(struct res_pool *pool, irq_cb_t cb, void *data)
 {
-	struct modvm_irq *irq;
-
-	if (WARN_ON(!dev || !cb))
+	if (!pool || !cb)
 		return NULL;
-
-	irq = modvm_devm_zalloc(dev, sizeof(*irq));
-	if (!irq)
-		return NULL;
-
-	irq->cb = cb;
-	irq->data = data;
-
+	struct irq *irq = res_zalloc(pool, sizeof(*irq));
+	if (irq) {
+		irq->cb = cb;
+		irq->data = data;
+	}
 	return irq;
 }
 
 /**
- * modvm_irq_set_level - assert or deassert the virtual interrupt line
+ * irq_set_level - assert or deassert the virtual interrupt line
  * @irq: the interrupt line instance
- * @level: the logical voltage level (1 for high, 0 for low)
+ * @level: the interrupt level (0 deasserted, 1 asserted)
  */
-void modvm_irq_set_level(struct modvm_irq *irq, int level)
+void irq_set_level(struct irq *irq, int level)
 {
 	if (likely(irq && irq->cb))
 		irq->cb(irq->data, level);

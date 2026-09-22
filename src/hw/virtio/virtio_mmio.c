@@ -1,15 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/util/err.h>
+#include <modvm/errno.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
 
-#include <modvm/core/bus.h>
-#include <modvm/core/devm.h>
+#include <modvm/core/io_map.h>
+#include <modvm/util/res_pool.h>
 #include <modvm/hw/virtio/virtio.h>
-#include <modvm/utils/compiler.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/compiler.h>
+#include <modvm/util/log.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/types.h>
 
 #include "virtqueue.h"
 #include "virtio_mmio_reg.h"
@@ -17,20 +18,12 @@
 #undef pr_fmt
 #define pr_fmt(fmt) "virtio_mmio: " fmt
 
-#define VIRTIO_STATUS_ACKNOWLEDGE 1
-#define VIRTIO_STATUS_DRIVER 2
-#define VIRTIO_STATUS_FEATURES_OK 8
-#define VIRTIO_STATUS_DRIVER_OK 4
-#define VIRTIO_STATUS_FAILED 128
-
 struct virtio_mmio_ctx {
 	struct virtio_device *vdev;
-	struct modvm_irq *irq;
+	struct irq *irq;
 
-	uint32_t status;
 	uint32_t device_features_sel;
 	uint32_t driver_features_sel;
-	uint64_t driver_features;
 	uint32_t queue_sel;
 	uint32_t interrupt_status;
 
@@ -45,32 +38,41 @@ struct virtio_mmio_ctx {
 	bool queue_ready[VIRTIO_MAX_VQS];
 };
 
-static void virtio_mmio_transport_set_irq_cb(void *transport_data)
+static void virtio_mmio_transport_notify_queue(void *transport_data)
 {
 	struct virtio_mmio_ctx *ctx = transport_data;
 
 	ctx->interrupt_status |= VIRTIO_MMIO_INT_VRING;
-	modvm_irq_set_level(ctx->irq, 1);
+	irq_set_level(ctx->irq, 1);
+}
+
+static void virtio_mmio_failed(void *data)
+{
+	struct virtio_mmio_ctx *ctx = data;
+	ctx->interrupt_status |= 2;
+	irq_set_level(ctx->irq, 1);
 }
 
 static const struct virtio_transport_ops virtio_mmio_transport = {
-	.set_irq_cb = virtio_mmio_transport_set_irq_cb,
+	.notify_queue = virtio_mmio_transport_notify_queue,
+	.notify_config = virtio_mmio_failed,
 };
 
-static uint64_t virtio_mmio_read(struct modvm_device *dev, uint64_t offset,
-				 uint8_t size)
+static uint64_t virtio_mmio_read(struct io_region *region, uint64_t offset, uint8_t size)
 {
+	struct device *dev = region->dev;
 	struct virtio_mmio_ctx *ctx = dev->priv;
 	struct virtio_device *vdev = ctx->vdev;
 	uint64_t features;
 
 	if (offset >= VIRTIO_MMIO_CONFIG) {
-		if (likely(vdev->ops->read_config))
-			return vdev->ops->read_config(
-				vdev, offset - VIRTIO_MMIO_CONFIG, size);
+		if (likely(vdev->device_ops->read_config))
+			return vdev->device_ops->read_config(vdev, offset - VIRTIO_MMIO_CONFIG, size);
 		return 0;
 	}
 
+	if (size != 4 || offset % 4)
+		return 0;
 	switch (offset) {
 	case VIRTIO_MMIO_MAGIC_VALUE:
 		return VIRTIO_MMIO_MAGIC;
@@ -81,19 +83,16 @@ static uint64_t virtio_mmio_read(struct modvm_device *dev, uint64_t offset,
 	case VIRTIO_MMIO_VENDOR_ID:
 		return VIRTIO_VENDOR_ID;
 	case VIRTIO_MMIO_DEVICE_FEATURES:
-		features = vdev->ops->get_features ?
-				   vdev->ops->get_features(vdev) :
-				   0;
+		features = vdev->device_ops->get_features(vdev);
 		/* Feature bit 32 (VIRTIO_F_VERSION_1) must be advertised for v1 */
-		features |= (1ULL << 32);
+		features |= VIRTIO_F_VERSION_1;
 		if (ctx->device_features_sel == 0)
 			return (uint32_t)(features & 0xFFFFFFFF);
 		else if (ctx->device_features_sel == 1)
 			return (uint32_t)((features >> 32) & 0xFFFFFFFF);
 		return 0;
 	case VIRTIO_MMIO_QUEUE_NUM_MAX:
-		/* Let's fix a safe default queue depth of 128 for mmio */
-		return 128;
+		return ctx->queue_sel < vdev->nr_vqs ? virtqueue_get_max_size(vdev->vqs[ctx->queue_sel]) : 0;
 	case VIRTIO_MMIO_QUEUE_READY:
 		if (ctx->queue_sel < vdev->nr_vqs)
 			return ctx->queue_ready[ctx->queue_sel] ? 1 : 0;
@@ -101,27 +100,28 @@ static uint64_t virtio_mmio_read(struct modvm_device *dev, uint64_t offset,
 	case VIRTIO_MMIO_INTERRUPT_STATUS:
 		return ctx->interrupt_status;
 	case VIRTIO_MMIO_STATUS:
-		return ctx->status;
+		return vdev->status;
 	default:
 		return 0;
 	}
 }
 
-static void virtio_mmio_write(struct modvm_device *dev, uint64_t offset,
-			      uint64_t val, uint8_t size)
+static void virtio_mmio_write(struct io_region *region, uint64_t offset, uint64_t val, uint8_t size)
 {
+	struct device *dev = region->dev;
 	struct virtio_mmio_ctx *ctx = dev->priv;
 	struct virtio_device *vdev = ctx->vdev;
-	uint16_t q_sel = ctx->queue_sel;
+	uint32_t q_sel = ctx->queue_sel;
 	uint64_t desc_gpa, avail_gpa, used_gpa;
 
 	if (offset >= VIRTIO_MMIO_CONFIG) {
-		if (likely(vdev->ops->write_config))
-			vdev->ops->write_config(
-				vdev, offset - VIRTIO_MMIO_CONFIG, val, size);
+		if (likely(vdev->device_ops->write_config))
+			vdev->device_ops->write_config(vdev, offset - VIRTIO_MMIO_CONFIG, val, size);
 		return;
 	}
 
+	if (size != 4 || offset % 4)
+		return;
 	switch (offset) {
 	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
 		ctx->device_features_sel = (uint32_t)val;
@@ -130,80 +130,72 @@ static void virtio_mmio_write(struct modvm_device *dev, uint64_t offset,
 		ctx->driver_features_sel = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_DRIVER_FEATURES:
-		if (ctx->driver_features_sel == 0)
-			ctx->driver_features =
-				(ctx->driver_features & 0xFFFFFFFF00000000ULL) |
-				val;
-		else if (ctx->driver_features_sel == 1)
-			ctx->driver_features =
-				(ctx->driver_features & 0xFFFFFFFFULL) |
-				(val << 32);
+		virtio_device_set_features_locked(vdev, ctx->driver_features_sel, (uint32_t)val);
 		break;
 	case VIRTIO_MMIO_QUEUE_SEL:
 		ctx->queue_sel = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_NUM:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_num[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_DESC_LOW:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_desc_lo[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_DESC_HIGH:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_desc_hi[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_avail_lo[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_avail_hi[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_USED_LOW:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_used_lo[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_USED_HIGH:
-		if (q_sel < VIRTIO_MAX_VQS)
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel])
 			ctx->queue_used_hi[q_sel] = (uint32_t)val;
 		break;
 	case VIRTIO_MMIO_QUEUE_READY:
-		if (q_sel < vdev->nr_vqs && val == 1) {
-			desc_gpa = ((uint64_t)ctx->queue_desc_hi[q_sel] << 32) |
-				   ctx->queue_desc_lo[q_sel];
-			avail_gpa =
-				((uint64_t)ctx->queue_avail_hi[q_sel] << 32) |
-				ctx->queue_avail_lo[q_sel];
-			used_gpa = ((uint64_t)ctx->queue_used_hi[q_sel] << 32) |
-				   ctx->queue_used_lo[q_sel];
+		if (q_sel < vdev->nr_vqs && val == 0) {
+			virtqueue_disable(vdev->vqs[q_sel]);
+			ctx->queue_ready[q_sel] = false;
+		}
+		if (q_sel < vdev->nr_vqs && !ctx->queue_ready[q_sel] && val == 1) {
+			desc_gpa = ((uint64_t)ctx->queue_desc_hi[q_sel] << 32) | ctx->queue_desc_lo[q_sel];
+			avail_gpa = ((uint64_t)ctx->queue_avail_hi[q_sel] << 32) | ctx->queue_avail_lo[q_sel];
+			used_gpa = ((uint64_t)ctx->queue_used_hi[q_sel] << 32) | ctx->queue_used_lo[q_sel];
 
-			if (virtqueue_set_addrs(
-				    vdev->vqs[q_sel], TO_GPA(desc_gpa),
-				    TO_GPA(avail_gpa), TO_GPA(used_gpa)) == 0)
+			if (ctx->queue_num[q_sel] > UINT16_MAX || virtqueue_set_size(vdev->vqs[q_sel], ctx->queue_num[q_sel]))
+				break;
+			if (virtqueue_set_addrs(vdev->vqs[q_sel], TO_GPA(desc_gpa), TO_GPA(avail_gpa), TO_GPA(used_gpa)) == 0)
 				ctx->queue_ready[q_sel] = true;
 		}
 		break;
 	case VIRTIO_MMIO_QUEUE_NOTIFY:
-		if (val < vdev->nr_vqs && likely(vdev->ops->notify_queue))
-			vdev->ops->notify_queue(vdev, (uint16_t)val);
+		if (val < vdev->nr_vqs && ctx->queue_ready[val] && virtio_device_ready_locked(vdev))
+			vdev->device_ops->notify_queue(vdev, (uint16_t)val);
 		break;
 	case VIRTIO_MMIO_INTERRUPT_ACK:
 		ctx->interrupt_status &= ~val;
 		if (ctx->interrupt_status == 0)
-			modvm_irq_set_level(ctx->irq, 0);
+			irq_set_level(ctx->irq, 0);
 		break;
 	case VIRTIO_MMIO_STATUS:
-		ctx->status = (uint32_t)val;
-		if (ctx->status == 0) {
-			if (vdev->ops->reset)
-				vdev->ops->reset(vdev);
-		} else if (ctx->status & VIRTIO_STATUS_FEATURES_OK) {
-			if (vdev->ops->set_features)
-				vdev->ops->set_features(vdev,
-							ctx->driver_features);
+		virtio_device_set_status_locked(vdev, val);
+		if (!val) {
+			struct irq *irq = ctx->irq;
+			memset(ctx, 0, sizeof(*ctx));
+			ctx->vdev = vdev;
+			ctx->irq = irq;
+			irq_set_level(irq, 0);
 		}
 		break;
 	default:
@@ -211,12 +203,20 @@ static void virtio_mmio_write(struct modvm_device *dev, uint64_t offset,
 	}
 }
 
-static const struct modvm_device_ops virtio_mmio_ops = {
+static void virtio_mmio_stop(struct device *dev)
+{
+	struct virtio_mmio_ctx *ctx = dev->priv;
+	virtio_device_stop_locked(ctx->vdev);
+	irq_set_level(ctx->irq, 0);
+}
+
+static const struct device_ops virtio_mmio_ops = {
+	.stop = virtio_mmio_stop,
 	.read = virtio_mmio_read,
 	.write = virtio_mmio_write,
 };
 
-static int virtio_mmio_instantiate(struct modvm_device *dev, void *pdata)
+static int virtio_mmio_realize(struct device *dev, void *pdata)
 {
 	struct virtio_mmio_pdata *plat = pdata;
 	struct virtio_mmio_ctx *ctx;
@@ -224,18 +224,16 @@ static int virtio_mmio_instantiate(struct modvm_device *dev, void *pdata)
 	int ret;
 
 	if (WARN_ON(!plat || !plat->vdev || !plat->irq))
-		return -EINVAL;
+		return -VM_EINVAL;
 
-	ctx = modvm_devm_zalloc(dev, sizeof(*ctx));
+	ctx = res_zalloc(&dev->resources, sizeof(*ctx));
 	if (!ctx)
-		return -ENOMEM;
+		return -VM_ENOMEM;
 
+	ret = virtio_device_adopt_locked(dev, plat->vdev, &virtio_mmio_transport, ctx);
+	if (ret < 0)
+		return ret;
 	vdev = plat->vdev;
-	vdev->parent_dev = dev;
-
-	vdev->transport = &virtio_mmio_transport;
-	vdev->transport_data = ctx;
-	vdev->mem = plat->mem_space;
 
 	ctx->vdev = vdev;
 	ctx->irq = plat->irq;
@@ -243,29 +241,26 @@ static int virtio_mmio_instantiate(struct modvm_device *dev, void *pdata)
 	dev->ops = &virtio_mmio_ops;
 	dev->priv = ctx;
 
-	/* Backend lifecycle initialization */
-	if (vdev->ops->realize) {
-		ret = vdev->ops->realize(vdev);
-		if (ret < 0)
-			return ret;
-	}
-
-	/* 0x200 bytes maps standard registers and 0x100 for config space */
-	ret = modvm_bus_register_region(MODVM_BUS_MMIO, plat->base, 0x200, dev);
+	/* Realize the VirtIO device model and its queues. */
+	ret = virtio_device_realize_locked(vdev);
 	if (ret < 0)
 		return ret;
 
-	pr_info("virtio-mmio transport mapped at 0x%08llx for device %u\n",
-		(unsigned long long)GPA_VAL(plat->base), vdev->device_id);
+	/* 0x100 bytes of transport registers followed by 0x100 bytes of device configuration. */
+	struct io_region *region = io_map_register_region_locked(IO_MMIO, plat->base, 0x200, dev);
+	if (IS_ERR(region))
+		return PTR_ERR(region);
+
+	pr_info("virtio-mmio transport mapped at 0x%08llx for device %u\n", (unsigned long long)GPA_VAL(plat->base), vdev->device_id);
 	return 0;
 }
 
-static const struct modvm_device_class virtio_mmio_class = {
+static const struct device_desc virtio_mmio_desc = {
 	.name = "virtio-mmio",
-	.instantiate = virtio_mmio_instantiate,
+	.realize = virtio_mmio_realize,
 };
 
-static void __attribute__((constructor)) register_virtio_mmio_class(void)
+static void __attribute__((constructor)) register_virtio_mmio_desc(void)
 {
-	modvm_device_class_register(&virtio_mmio_class);
+	device_register(&virtio_mmio_desc);
 }

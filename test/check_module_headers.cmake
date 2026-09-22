@@ -1,0 +1,47 @@
+# A positive compile distinguishes a working view from a missing include path;
+# the negative compile proves that an unrelated module is not visible there.
+function(check_view target allowed forbidden)
+    set(source "${BUILD}/interfaces/${target}/boundary-check.c")
+    set(view "${BUILD}/interfaces/${target}")
+    file(WRITE "${source}" "#include <${allowed}>\n")
+    execute_process(COMMAND "${CC}" -std=c11 -fsyntax-only "-I${view}" "${source}"
+        RESULT_VARIABLE result ERROR_VARIABLE diagnostic)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Allowed header unavailable to ${target}: ${diagnostic}")
+    endif()
+    file(WRITE "${source}" "#include <${forbidden}>\n")
+    execute_process(COMMAND "${CC}" -std=c11 -fsyntax-only "-I${view}" "${source}"
+        RESULT_VARIABLE result ERROR_VARIABLE diagnostic)
+    file(REMOVE "${source}")
+    if(result EQUAL 0 OR NOT diagnostic MATCHES "${forbidden}")
+        message(FATAL_ERROR "Header isolation failed for ${target}: ${forbidden}: ${diagnostic}")
+    endif()
+endfunction()
+check_view(modvm_host modvm/host/thread.h modvm/core/vm.h)
+check_view(modvm_util modvm/util/res_pool.h modvm/core/device.h)
+check_view(modvm_io modvm/io/net.h modvm/core/vm.h)
+check_view(modvm_backend modvm/io/char.h modvm/core/device.h)
+check_view(modvm_core modvm/core/vm.h modvm/hw/pci/pci.h)
+check_view(modvm_loader modvm/arch/x86/regs.h modvm/hw/virtio/virtio.h)
+check_view(modvm_accel modvm/core/accel.h modvm/hw/virtio/virtio.h)
+
+# Check every exposed header in every target view. Compiler implementation
+# fragments are deliberately included through compiler.h, never directly.
+foreach(target modvm_host modvm_util modvm_io modvm_backend modvm_core modvm_loader modvm_accel modvm_hw)
+    set(view "${BUILD}/interfaces/${target}")
+    file(GLOB_RECURSE headers "${view}/modvm/*.h")
+    set(source "${view}/header-check.c")
+    foreach(header IN LISTS headers)
+        file(RELATIVE_PATH relative "${view}" "${header}")
+        if(relative MATCHES "^modvm/util/compiler-(gcc|clang)\\.h$")
+            continue()
+        endif()
+        file(WRITE "${source}" "#include <${relative}>\n")
+        execute_process(COMMAND "${CC}" -std=c11 -Werror -fsyntax-only "-I${view}" "${source}"
+            RESULT_VARIABLE result ERROR_VARIABLE diagnostic)
+        if(NOT result EQUAL 0)
+            message(FATAL_ERROR "Header is not self-contained in ${target}: ${relative}: ${diagnostic}")
+        endif()
+    endforeach()
+    file(REMOVE "${source}")
+endforeach()

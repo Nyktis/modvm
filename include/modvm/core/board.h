@@ -2,33 +2,34 @@
 #ifndef MODVM_CORE_BOARD_H
 #define MODVM_CORE_BOARD_H
 
-#include <modvm/core/modvm.h>
+struct vm_ctx;
 
 /**
- * struct modvm_board_ops - routines for wiring up a specific motherboard topology.
+ * struct board_ops - board initialization callbacks
  * @init: early initialization (e.g., RAM mapping, pre-vCPU IRQ controllers).
- * @late_init: post-vCPU initialization (e.g., ARM64 VGIC redistributors).
- * @reset: configure initial CPU states and load firmware.
+ * @late_init: initialization that requires vCPUs to exist.
+ * @boot: one-time boot image loading and initial CPU setup; not a reset operation.
  */
-struct modvm_board_ops {
-	int (*init)(struct modvm_ctx *ctx);
-	int (*late_init)(struct modvm_ctx *ctx);
-	int (*reset)(struct modvm_ctx *ctx);
+struct board_ops {
+	int (*init)(struct vm_ctx *ctx);
+	int (*late_init)(struct vm_ctx *ctx);
+	int (*boot)(struct vm_ctx *ctx);
 };
 
 /**
- * struct modvm_board - static blueprint for a motherboard.
- * @name: identifier used in command line arguments (e.g., "pc", "virt").
+ * struct board_desc - board description
+ * @name: name unique within the board registry, selected on the command line
  * @desc: human-readable description.
  * @ops: pointer to the operational methods.
  */
-struct modvm_board {
+struct board_desc {
 	const char *name;
 	const char *desc;
-	const struct modvm_board_ops *ops;
+	const struct board_ops *ops;
 };
 
-void modvm_board_register(const struct modvm_board *board);
-const struct modvm_board *modvm_board_find(const char *name);
+/* Startup-only registration; invalid, duplicate or excess entries are fatal programming errors. */
+void board_register(const struct board_desc *board);
+const struct board_desc *board_find(const char *name);
 
 #endif /* MODVM_CORE_BOARD_H */

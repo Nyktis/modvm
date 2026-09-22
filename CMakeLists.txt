@@ -12,11 +12,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # Enable strict compiler warnings for quality assurance
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     add_compile_options(-Wall -Wextra -Werror -Wno-unused-value)
 endif()
 
-if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
     message(STATUS "Clang detected: Enabling Static Thread Safety Analysis")
     add_compile_options(-Wthread-safety)
     add_compile_definitions(WARN_CONTEXT_ANALYSIS)
@@ -24,7 +24,7 @@ endif()
 
 option(ENABLE_SANITIZERS "Enable Address and Undefined Behavior Sanitizers" ON)
 
-if(ENABLE_SANITIZERS)
+if(ENABLE_SANITIZERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     message(STATUS "Sanitizers (ASAN & UBSAN) are ENABLED")
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address,undefined)
@@ -34,42 +34,33 @@ option(ENABLE_HARDENING "Enable security hardening flags (PIE, RELRO, Stack Prot
 
 if(ENABLE_HARDENING)
     message(STATUS "Security Hardening is ENABLED")
-    
+
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-    
-    add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -O2)
-    
-    add_link_options("-Wl,-z,relro,-z,now")
+
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+        add_compile_options(-fstack-protector-strong -O2)
+    endif()
 endif()
 
-# Detect host CPU architecture and set corresponding preprocessor macros
+# Detect host CPU architecture
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64|x86_64|AMD64")
-    set(MODVM_ARCH "x86_64")
-    add_compile_definitions(ARCH_X86_64)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-    set(MODVM_ARCH "aarch64")
-    add_compile_definitions(ARCH_AARCH64)
+    set(MODVM_HOST_ARCH "x86_64")
 else()
-    message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+    message(FATAL_ERROR "Unsupported host architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-# Detect host Operating System and set corresponding preprocessor macros
+# Detect host Operating System
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(MODVM_OS "linux")
-    add_compile_definitions(OS_LINUX)
 else()
     message(FATAL_ERROR "Unsupported OS: ${CMAKE_SYSTEM_NAME}")
 endif()
 
-message(STATUS "Configuring ModVM for ${MODVM_OS}-${MODVM_ARCH}")
+set(MODVM_GUEST_ARCH "${MODVM_HOST_ARCH}" CACHE STRING "Guest architecture")
+message(STATUS "Configuring ModVM host=${MODVM_OS}-${MODVM_HOST_ARCH} guest=${MODVM_GUEST_ARCH}")
+include(CTest)
 
-# Locate and configure the standard threading library (handles -pthread automatically)
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_package(Threads REQUIRED)
-
-# Enable CTest support for automated testing
-enable_testing()
-
-# Delegate build tasks to source and test subdirectories
 add_subdirectory(src)
-add_subdirectory(tests)
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()

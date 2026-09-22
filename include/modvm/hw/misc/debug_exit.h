@@ -2,16 +2,16 @@
 #ifndef MODVM_HW_MISC_DEBUG_EXIT_H
 #define MODVM_HW_MISC_DEBUG_EXIT_H
 
-#include <modvm/core/bus.h>
-#include <modvm/utils/types.h>
+#include <modvm/core/io_map.h>
+#include <modvm/util/types.h>
 
 /**
- * struct modvm_debug_exit_pdata - platform routing data for debug exit device
- * @bus_type: the target address space (PIO or MMIO)
- * @base: the absolute starting address on the system bus
+ * struct debug_exit_pdata - platform routing data for debug exit device
+ * @io_space: the target address space (PIO or MMIO)
+ * @base: the absolute starting address in the selected I/O space
  */
-struct modvm_debug_exit_pdata {
-	enum modvm_bus_type bus_type;
+struct debug_exit_pdata {
+	enum io_space io_space;
 	gpa_t base;
 };
 

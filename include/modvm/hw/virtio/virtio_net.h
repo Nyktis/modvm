@@ -2,11 +2,10 @@
 #ifndef MODVM_HW_VIRTIO_VIRTIO_NET_H
 #define MODVM_HW_VIRTIO_VIRTIO_NET_H
 
-struct modvm_ctx;
-struct modvm_net;
+struct vm_ctx;
+struct net_backend;
 struct virtio_device;
 
-struct virtio_device *virtio_net_create(struct modvm_ctx *ctx,
-					struct modvm_net *backend);
+struct virtio_device *virtio_net_create(struct vm_ctx *ctx, struct net_backend *backend);
 
 #endif /* MODVM_HW_VIRTIO_VIRTIO_NET_H */

@@ -25,8 +25,8 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE. */
-#include <modvm/utils/types.h>
-#include <modvm/utils/compiler.h>
+#include <modvm/util/types.h>
+#include <modvm/util/compiler.h>
 
 /* Feature bits */
 #define VIRTIO_BLK_F_SIZE_MAX 1 /* Indicates maximum segment size */
@@ -40,16 +40,7 @@
 
 #define VIRTIO_BLK_ID_BYTES 20 /* ID string length */
 
-/*
- * Command types
- *
- * Usage is a bit tricky as some bits are used as flags and some are not.
- *
- * Rules:
- *   VIRTIO_BLK_T_OUT may be combined with VIRTIO_BLK_T_SCSI_CMD or
- *   VIRTIO_BLK_T_BARRIER.  VIRTIO_BLK_T_FLUSH is a command of its own
- *   and may not be combined with any of the other flags.
- */
+/* Block request type codes. */
 
 /* These two define direction. */
 #define VIRTIO_BLK_T_IN 0
@@ -79,7 +70,7 @@ struct virtio_blk_geometry {
  * struct virtio_blk_config - standard configuration space for block devices
  *
  * Defines the static and dynamic parameters exposed to the guest OS driver.
- * Only the fields guarded by negotiated feature bits are actively parsed.
+ * Capacity is unconditional; optional fields depend on their feature bits.
  */
 struct virtio_blk_config {
 	/* The capacity (in 512-byte sectors). */
@@ -117,7 +108,7 @@ struct virtio_blk_config {
  * struct virtio_blk_outhdr - request header prepended to every operation
  * @type: requested operation (e.g., VIRTIO_BLK_T_IN)
  * @ioprio: I/O priority (unused by basic backends)
- * @sector: target sector (512-byte aligned) on the disk
+ * @sector: starting disk sector number, in units of 512 bytes
  */
 struct virtio_blk_outhdr {
 	/* VIRTIO_BLK_T* */

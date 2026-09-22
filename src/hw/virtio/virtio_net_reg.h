@@ -25,8 +25,8 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE. */
-#include <modvm/utils/types.h>
-#include <modvm/utils/compiler.h>
+#include <modvm/util/types.h>
+#include <modvm/util/compiler.h>
 
 /* The feature bitmap for virtio net */
 #define VIRTIO_NET_F_MAC 5 /* Host has given MAC address. */
@@ -77,7 +77,8 @@ struct virtio_net_config {
  * struct virtio_net_hdr_v1 - modern network packet header
  *
  * This header comes first in the scatter-gather list for every TX and RX
- * packet. It facilitates GSO, checksum offloading, and buffer merging.
+ * packet. Offload and merged-buffer fields are part of the wire layout;
+ * this device does not advertise those features.
  */
 struct virtio_net_hdr_v1 {
 	uint8_t flags;
@@ -105,7 +106,7 @@ struct virtio_net_ctrl_hdr {
 #define VIRTIO_NET_ERR 1
 
 /*
- * Control the RX mode, ie. promisucous, allmulti, etc...
+ * Standard RX mode command definitions; this device does not advertise CTRL_RX.
  * All commands require an "out" sg entry containing a 1 byte
  * state value, zero = disable, non-zero = enable.  Commands
  * 0 and 1 are supported with the VIRTIO_NET_F_CTRL_RX feature.
@@ -115,21 +116,9 @@ struct virtio_net_ctrl_hdr {
 #define VIRTIO_NET_CTRL_RX_PROMISC 0
 #define VIRTIO_NET_CTRL_RX_ALLMULTI 1
 
-/*
- * Control the MAC
- *
- * The MAC filter table is not needed
- *
- * In addition to the class/cmd header, the TABLE_SET command requires
- * two out scatterlists.  Each contains a 4 byte count of entries followed
- * by a concatenated byte stream of the ETH_ALEN MAC addresses.  The
- * first sg list contains unicast addresses, the second is for multicast.
- * This functionality is present if the VIRTIO_NET_F_CTRL_RX feature
- * is available.
- *
- * The ADDR_SET command requests one out scatterlist, it contains a
- * 6 bytes MAC address. This functionality is present if the
- * VIRTIO_NET_F_CTRL_MAC_ADDR feature is available.
+/* MAC control command codes. This device implements ADDR_SET only, with
+ * VIRTIO_NET_F_CTRL_MAC_ADDR. Its payload is a six-byte MAC address.
+ * TABLE_SET is defined here but is not implemented or advertised.
  */
 #define VIRTIO_NET_CTRL_MAC 1
 #define VIRTIO_NET_CTRL_MAC_TABLE_SET 0

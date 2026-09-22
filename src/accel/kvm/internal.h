@@ -34,43 +34,36 @@ typedef struct {
 #define IS_VALID_FD(x) (FD_VAL(x) >= 0)
 
 /**
- * struct modvm_kvm_state - KVM specific virtual machine acceleration state
- * @kvm_fd: global handle to the hypervisor character device
+ * struct kvm_state - KVM specific virtual machine acceleration state
+ * @kvm_fd: handle to /dev/kvm owned by this accelerator instance
  * @vm_fd: handle to this specific virtual machine instance
  * @mem_slot_idx: counter for allocating sequential hardware memory slots
  */
-struct modvm_kvm_state {
+struct kvm_state {
 	kvm_fd_t kvm_fd;
 	vm_fd_t vm_fd;
 	mem_slot_t mem_slot_idx;
 };
 
 /**
- * struct modvm_kvm_vcpu_state - KVM specific virtual processor state
+ * struct kvm_vcpu_state - KVM specific virtual processor state
  * @vcpu_fd: handle to this specific virtual processor
  * @run_size: size of the memory-mapped hypervisor run structure
  * @run: shared memory region for hypervisor communication
  */
-struct modvm_kvm_vcpu_state {
+struct kvm_vcpu_state {
 	vcpu_fd_t vcpu_fd;
 	int run_size;
 	struct kvm_run *run;
 };
 
-int modvm_kvm_arch_vcpu_init(struct modvm_vcpu *vcpu);
-int modvm_kvm_arch_vcpu_get_regs(struct modvm_vcpu *vcpu,
-				 enum modvm_reg_class reg_class, void *buf,
-				 size_t size);
-int modvm_kvm_arch_vcpu_set_regs(struct modvm_vcpu *vcpu,
-				 enum modvm_reg_class reg_class,
-				 const void *buf, size_t size);
-int modvm_kvm_arch_vcpu_get_reg(struct modvm_vcpu *vcpu, uint64_t reg_id,
-				uint64_t *val);
-int modvm_kvm_arch_vcpu_set_reg(struct modvm_vcpu *vcpu, uint64_t reg_id,
-				uint64_t val);
-int modvm_kvm_arch_vcpu_handle_exit(struct modvm_vcpu *vcpu,
-				    struct kvm_run *run);
+int kvm_arch_vcpu_init(struct vcpu *vcpu);
+int kvm_arch_vcpu_get_regs(struct vcpu *vcpu, enum reg_class reg_class, void *buf, size_t size);
+int kvm_arch_vcpu_set_regs(struct vcpu *vcpu, enum reg_class reg_class, const void *buf, size_t size);
+int kvm_arch_vcpu_get_reg(struct vcpu *vcpu, uint64_t reg_id, uint64_t *val);
+int kvm_arch_vcpu_set_reg(struct vcpu *vcpu, uint64_t reg_id, uint64_t val);
+int kvm_arch_vcpu_handle_exit(struct vcpu *vcpu, struct kvm_run *run);
 
-extern const struct modvm_vcpu_ops modvm_kvm_vcpu_ops;
+extern const struct vcpu_ops kvm_vcpu_ops;
 
 #endif /* MODVM_ACCEL_KVM_INTERNAL_H */

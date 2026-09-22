@@ -1,19 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/core/device.h>
+#include <modvm/errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <errno.h>
 
-#include <modvm/core/bus.h>
-#include <modvm/core/devm.h>
+#include <modvm/core/io_map.h>
+#include <modvm/core/vm.h>
+#include <modvm/util/res_pool.h>
 #include <modvm/hw/char/serial.h>
-#include <modvm/utils/compiler.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/err.h>
-#include <modvm/os/thread.h>
+#include <modvm/util/compiler.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/log.h>
+#include <modvm/util/err.h>
+#include <modvm/host/thread.h>
 
-#include "serial_reg.h"
+#include "uart_16550a_reg.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "uart_16550a: " fmt
@@ -25,10 +27,10 @@
 
 /**
  * struct uart_16550a_ctx - internal state machine for the 16550a uart
- * @lock: mutex to serialize access from multiple executing processors
  * @irq: hardware interrupt line connection to the system board
  * @console: host character device handling the stream presentation
- * @event_loop: asynchronous I/O dispatcher reference
+ * @io_ctx: device callback execution context reference
+ * @vm: borrowed VM receiving console exit and fatal-error notifications
  * @reg_shift: byte shift for register spacing (0 for 8-bit PIO, 2 for 32-bit MMIO aligned)
  * @dll: baud rate divisor register (low byte)
  * @dlm: baud rate divisor register (high byte)
@@ -48,6 +50,7 @@
  * @backlog_tail: read index for backlog_fifo
  * @backlog_cnt: current number of bytes in backlog_fifo
  * @rx_paused: backpressure state indicating the host backend is throttled
+ * @rx_bound: whether this UART owns the console receive binding
  * @tx_fifo: 16-byte transmitter ring buffer
  * @tx_head: write index for tx_fifo
  * @tx_tail: read index for tx_fifo
@@ -56,66 +59,67 @@
  * @rx_timeout: FIFO Timeout interrupt pending state
  * @thre_int_pending: internal flip-flop for edge-triggered thre interrupts
  */
+/* All register accesses, realization and backend callbacks run under the VM
+ * I/O lock. No separate UART lock or inverse lock order is needed. */
 struct uart_16550a_ctx {
-	struct os_mutex *lock;
-	struct modvm_irq *irq;
-	struct modvm_chardev *console;
-	struct modvm_event_loop *event_loop;
+	struct irq *irq;
+	struct char_backend *console;
+	struct io_ctx *io_ctx;
+	struct vm_ctx *vm;
 
 	uint8_t reg_shift;
 
-	uint8_t dll __guarded_by(lock);
-	uint8_t dlm __guarded_by(lock);
-	uint8_t ier __guarded_by(lock);
-	uint8_t fcr __guarded_by(lock);
-	uint8_t lcr __guarded_by(lock);
-	uint8_t mcr __guarded_by(lock);
-	uint8_t lsr __guarded_by(lock);
-	uint8_t msr __guarded_by(lock);
-	uint8_t scr __guarded_by(lock);
+	uint8_t dll;
+	uint8_t dlm;
+	uint8_t ier;
+	uint8_t fcr;
+	uint8_t lcr;
+	uint8_t mcr;
+	uint8_t lsr;
+	uint8_t msr;
+	uint8_t scr;
 
 	/*
 	 * PC16550D features integrated transmit and receive FIFOs.
 	 * Both FIFOs have a maximum capacity of 16 bytes.
 	 */
-	uint8_t rx_fifo[UART_FIFO_SIZE] __guarded_by(lock);
-	uint8_t rx_head __guarded_by(lock);
-	uint8_t rx_tail __guarded_by(lock);
-	uint8_t rx_cnt __guarded_by(lock);
+	uint8_t rx_fifo[UART_FIFO_SIZE];
+	uint8_t rx_head;
+	uint8_t rx_tail;
+	uint8_t rx_cnt;
 
 	/* Software backlog buffer for flow control */
-	uint8_t backlog_fifo[UART_BACKLOG_SIZE] __guarded_by(lock);
-	uint16_t backlog_head __guarded_by(lock);
-	uint16_t backlog_tail __guarded_by(lock);
-	uint16_t backlog_cnt __guarded_by(lock);
-	bool rx_paused __guarded_by(lock);
+	uint8_t backlog_fifo[UART_BACKLOG_SIZE];
+	uint16_t backlog_head;
+	uint16_t backlog_tail;
+	uint16_t backlog_cnt;
+	bool rx_paused;
+	bool rx_bound;
 
-	uint8_t tx_fifo[UART_FIFO_SIZE] __guarded_by(lock);
-	uint8_t tx_head __guarded_by(lock);
-	uint8_t tx_tail __guarded_by(lock);
-	uint8_t tx_cnt __guarded_by(lock);
+	uint8_t tx_fifo[UART_FIFO_SIZE];
+	uint8_t tx_head;
+	uint8_t tx_tail;
+	uint8_t tx_cnt;
 
 	/*
 	 * Trigger level for RCVR FIFO interrupt (1, 4, 8, or 14 bytes).
 	 */
-	uint8_t rx_trigger_level __guarded_by(lock);
+	uint8_t rx_trigger_level;
 
 	/*
 	 * FIFO Timeout interrupt pending state.
 	 */
-	bool rx_timeout __guarded_by(lock);
+	bool rx_timeout;
 
-	bool thre_int_pending __guarded_by(lock);
+	bool thre_int_pending;
 };
 
 static inline bool uart_16550a_dlab_is_set(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	return (ctx->lcr & UART_LCR_DLAB) != 0;
 }
 
 static inline bool uart_16550a_loopback_is_enabled(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	/* According to 8.6.7, MCR bit 4 enables local loopback feature */
 	return (ctx->mcr & UART_MCR_LOOP) != 0;
@@ -130,15 +134,14 @@ static inline bool uart_16550a_loopback_is_enabled(struct uart_16550a_ctx *ctx)
  * line status bits.
  */
 static inline void uart_16550a_rx_fifo_clear(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	ctx->rx_head = 0;
 	ctx->rx_tail = 0;
 	ctx->rx_cnt = 0;
 
 	/*
-	 * 8.6.4: Writing a 1 to FCR1 clears all bytes in the RCVR FIFO 
-	 * and resets its counter logic to 0. 
+	 * 8.6.4: Writing a 1 to FCR1 clears all bytes in the RCVR FIFO
+	 * and resets its counter logic to 0.
 	 */
 	ctx->lsr &= ~(UART_LSR_DR | UART_LSR_OE);
 }
@@ -148,7 +151,6 @@ static inline void uart_16550a_rx_fifo_clear(struct uart_16550a_ctx *ctx)
  * @ctx: the uart state machine context
  */
 static inline void uart_16550a_tx_fifo_clear(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	ctx->tx_head = 0;
 	ctx->tx_tail = 0;
@@ -171,8 +173,7 @@ static inline void uart_16550a_tx_fifo_clear(struct uart_16550a_ctx *ctx)
  * an overrun error will occur only after the FIFO is full. The character
  * in the shift register is overwritten, but not transferred to the FIFO.
  */
-static inline void uart_16550a_rx_fifo_push(struct uart_16550a_ctx *ctx,
-					    uint8_t c) __must_hold(ctx->lock)
+static inline void uart_16550a_rx_fifo_push(struct uart_16550a_ctx *ctx, uint8_t c)
 {
 	if (unlikely(ctx->rx_cnt >= UART_FIFO_SIZE)) {
 		ctx->lsr |= UART_LSR_OE;
@@ -186,34 +187,33 @@ static inline void uart_16550a_rx_fifo_push(struct uart_16550a_ctx *ctx,
 }
 
 /**
- * uart_16550a_hw_fifo_refill - transfer bytes from backlog to hardware FIFO
+ * uart_16550a_rx_fifo_refill - transfer bytes from backlog to hardware FIFO
  * @ctx: the uart state machine context
  *
  * Triggers backpressure release (resume_rx) if the backlog falls below
  * the low watermark.
  */
-static inline void uart_16550a_hw_fifo_refill(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
+static inline void uart_16550a_rx_fifo_refill(struct uart_16550a_ctx *ctx)
 {
 	bool pushed = false;
 
 	while (ctx->backlog_cnt > 0 && ctx->rx_cnt < UART_FIFO_SIZE) {
-		uart_16550a_rx_fifo_push(ctx,
-					 ctx->backlog_fifo[ctx->backlog_tail]);
+		uart_16550a_rx_fifo_push(ctx, ctx->backlog_fifo[ctx->backlog_tail]);
 		ctx->backlog_tail = (ctx->backlog_tail + 1) % UART_BACKLOG_SIZE;
 		ctx->backlog_cnt--;
 		pushed = true;
 	}
 
-	if (unlikely(ctx->rx_paused &&
-		     ctx->backlog_cnt < UART_BACKLOG_LOW_WATERMARK)) {
-		modvm_chardev_resume_rx(ctx->console);
-		ctx->rx_paused = false;
+	if (unlikely(ctx->rx_paused && ctx->backlog_cnt < UART_BACKLOG_LOW_WATERMARK)) {
+		int ret = char_resume_rx_locked(ctx->console);
+		if (ret < 0)
+			vm_report_error(ctx->vm, ret);
+		else
+			ctx->rx_paused = false;
 	}
 
 	if (pushed) {
-		if ((ctx->fcr & UART_FCR_ENABLE_FIFO) && ctx->rx_cnt > 0 &&
-		    ctx->rx_cnt < ctx->rx_trigger_level)
+		if ((ctx->fcr & UART_FCR_ENABLE_FIFO) && ctx->rx_cnt > 0 && ctx->rx_cnt < ctx->rx_trigger_level)
 			ctx->rx_timeout = true;
 		else
 			ctx->rx_timeout = false;
@@ -228,7 +228,6 @@ static inline void uart_16550a_hw_fifo_refill(struct uart_16550a_ctx *ctx)
  * Returns the dequeued byte, or 0 if empty.
  */
 static inline uint8_t uart_16550a_rx_fifo_pop(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	uint8_t val;
 
@@ -256,27 +255,26 @@ static inline uint8_t uart_16550a_rx_fifo_pop(struct uart_16550a_ctx *ctx)
  * shift register and triggers the THRE interrupt.
  */
 static void uart_16550a_tx_flush(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	if (likely(ctx->tx_cnt > 0)) {
-		if (likely(ctx->console && ctx->console->ops->write)) {
+		if (likely(ctx->console)) {
 			uint8_t buf[UART_FIFO_SIZE];
 			int i;
 
 			for (i = 0; i < ctx->tx_cnt; i++) {
 				buf[i] = ctx->tx_fifo[ctx->tx_tail];
-				ctx->tx_tail =
-					(ctx->tx_tail + 1) % UART_FIFO_SIZE;
+				ctx->tx_tail = (ctx->tx_tail + 1) % UART_FIFO_SIZE;
 			}
 
-			ctx->console->ops->write(ctx->console, buf,
-						 ctx->tx_cnt);
+			int ret = ctx->console->ops->write(ctx->console, buf, ctx->tx_cnt);
+			if (ret < 0)
+				vm_report_error(ctx->vm, ret);
 		}
 		ctx->tx_cnt = 0;
 	}
 
 	/*
-	 * Datasheet 8.6.3: TEMT and THRE are set to 1 when both the THR 
+	 * Datasheet 8.6.3: TEMT and THRE are set to 1 when both the THR
 	 * and TSR are empty.
 	 */
 	ctx->lsr |= (UART_LSR_THRE | UART_LSR_TEMT);
@@ -284,7 +282,6 @@ static void uart_16550a_tx_flush(struct uart_16550a_ctx *ctx)
 }
 
 static uint8_t uart_16550a_iir_get(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	/*
          * Bits 6 and 7 are set to 1 if FIFOs are enabled.
@@ -296,8 +293,7 @@ static uint8_t uart_16550a_iir_get(struct uart_16550a_ctx *ctx)
 	bool trigger_reached;
 
 	/* Priority 1: Receiver Line Status (Errors) */
-	if ((ctx->ier & UART_IER_RLSI) &&
-	    (ctx->lsr & UART_LSR_BRK_ERROR_BITS)) {
+	if ((ctx->ier & UART_IER_RLSI) && (ctx->lsr & UART_LSR_BRK_ERROR_BITS)) {
 		return iir | 0x06;
 	}
 
@@ -305,9 +301,7 @@ static uint8_t uart_16550a_iir_get(struct uart_16550a_ctx *ctx)
 	 * Priority 2: Received Data Available OR Character Timeout.
 	 * Check if the FIFO byte count meets the programmed trigger level.
 	 */
-	trigger_reached = (ctx->fcr & UART_FCR_ENABLE_FIFO) ?
-				  (ctx->rx_cnt >= ctx->rx_trigger_level) :
-				  (ctx->rx_cnt > 0);
+	trigger_reached = (ctx->fcr & UART_FCR_ENABLE_FIFO) ? (ctx->rx_cnt >= ctx->rx_trigger_level) : (ctx->rx_cnt > 0);
 	if (ctx->ier & UART_IER_RDI) {
 		if (trigger_reached)
 			return iir | 0x04;
@@ -330,7 +324,6 @@ static uint8_t uart_16550a_iir_get(struct uart_16550a_ctx *ctx)
 }
 
 static void uart_16550a_irq_update(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	uint8_t iir = uart_16550a_iir_get(ctx);
 
@@ -340,22 +333,17 @@ static void uart_16550a_irq_update(struct uart_16550a_ctx *ctx)
          */
 	int level = (iir & UART_IIR_NO_INT) ? 0 : 1;
 
-	modvm_irq_set_level(ctx->irq, level);
+	irq_set_level(ctx->irq, level);
 }
 
 static void uart_16550a_msr_update(struct uart_16550a_ctx *ctx)
-	__must_hold(ctx->lock)
 {
 	uint8_t old_msr = ctx->msr;
 	uint8_t new_msr = 0;
 	uint8_t delta;
 
 	if (!uart_16550a_loopback_is_enabled(ctx)) {
-		/*
-		 * In normal mode, MSR is driven by external hardware lines.
-		 * We simulate unconnected lines where Carrier Detect, Data Set Ready,
-		 * and Clear To Send are asserted (typical null-modem behavior).
-		 */
+		/* No host modem-control input is available; keep DCD, DSR and CTS asserted. */
 		new_msr = UART_MSR_DCD | UART_MSR_DSR | UART_MSR_CTS;
 	} else {
 		/*
@@ -375,9 +363,7 @@ static void uart_16550a_msr_update(struct uart_16550a_ctx *ctx)
 			new_msr |= UART_MSR_DCD;
 	}
 
-	delta = ((old_msr ^ new_msr) &
-		 (UART_MSR_DCD | UART_MSR_DSR | UART_MSR_CTS)) >>
-		4;
+	delta = ((old_msr ^ new_msr) & (UART_MSR_DCD | UART_MSR_DSR | UART_MSR_CTS)) >> 4;
 
 	/*
 	 * Trailing Edge of Ring Indicator (TERI).
@@ -390,8 +376,7 @@ static void uart_16550a_msr_update(struct uart_16550a_ctx *ctx)
 	ctx->msr = new_msr | (old_msr & UART_MSR_ANY_DELTA) | delta;
 }
 
-static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx,
-				    uint16_t offset) __must_hold(ctx->lock)
+static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx, uint16_t offset)
 {
 	uint8_t val = 0;
 
@@ -400,11 +385,7 @@ static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx,
 		if (unlikely(uart_16550a_dlab_is_set(ctx)))
 			return ctx->dll;
 
-		/*
-		 * Datasheet 8.6.3: Reading the Receiver Buffer clears the DR bit
-		 * implicitly via our uart_16550a_rx_fifo_pop() helper. It also clears 
-		 * the timeout condition.
-		 */
+		/* Pop clears the timeout and clears DR only when the receive FIFO becomes empty. */
 		return uart_16550a_rx_fifo_pop(ctx);
 
 	case UART_IER:
@@ -415,8 +396,8 @@ static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx,
 	case UART_IIR:
 		val = uart_16550a_iir_get(ctx);
 		/*
-		 * Datasheet 8.4.1 & Table 5: Reading the IIR Register (if source of 
-		 * interrupt) clears the Transmitter Holding Register Empty interrupt. 
+		 * Datasheet 8.4.1 & Table 5: Reading the IIR Register (if source of
+		 * interrupt) clears the Transmitter Holding Register Empty interrupt.
 		 */
 		if ((val & UART_IIR_ID) == 0x02)
 			ctx->thre_int_pending = false;
@@ -431,7 +412,7 @@ static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx,
 	case UART_LSR:
 		val = ctx->lsr;
 		/*
-		 * Datasheet 8.6.3: In the FIFO mode LSR7 is set when there is at least 
+		 * Datasheet 8.6.3: In the FIFO mode LSR7 is set when there is at least
 		 * one parity error, framing error or break indication in the FIFO.
 		 */
 		val &= ~0x80;
@@ -449,14 +430,12 @@ static uint8_t uart_16550a_reg_read(struct uart_16550a_ctx *ctx,
 		return ctx->scr;
 
 	default:
-		pr_warn_once("read from undefined peripheral offset: 0x%x\n",
-			     offset);
+		pr_warn_once("read from undefined peripheral offset: 0x%x\n", offset);
 		return 0xff;
 	}
 }
 
-static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
-				  uint8_t val) __must_hold(ctx->lock)
+static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset, uint8_t val)
 {
 	uint8_t old_ier;
 
@@ -469,7 +448,7 @@ static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
 
 		if (unlikely(uart_16550a_loopback_is_enabled(ctx))) {
 			/*
-			 * Datasheet 8.6.7: In loopback mode, data that is transmitted 
+			 * Datasheet 8.6.7: In loopback mode, data that is transmitted
 			 * is immediately received.
 			 */
 			uart_16550a_rx_fifo_push(ctx, val);
@@ -481,14 +460,7 @@ static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
 			ctx->lsr &= ~(UART_LSR_THRE | UART_LSR_TEMT);
 			ctx->thre_int_pending = false;
 
-			/*
-			 * Don't do this:
-			 *
-			 * if (!(ctx->fcr & UART_FCR_ENABLE_FIFO) ||
-			 *     ctx->tx_cnt >= UART_FIFO_SIZE) {
-			 * 	uart_16550a_tx_flush(ctx);
-			 * }
-			 */
+			/* Flush each write so short console messages do not wait for a full FIFO. */
 			uart_16550a_tx_flush(ctx);
 		}
 		break;
@@ -498,7 +470,7 @@ static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
 			ctx->dlm = val;
 			return;
 		}
-		/* 
+		/*
 		 * Datasheet 8.6.3: IER bits 4-7 are always logic 0
 		 */
 		old_ier = ctx->ier;
@@ -506,7 +478,7 @@ static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
 
 		/*
 		 * If the THRE interrupt was just enabled, and the buffer is
-		 * currently empty (which it always is in our simulation),
+		 * currently empty,
 		 * the interrupt must fire immediately to satisfy OS IRQ probing.
 		 */
 		if (!(old_ier & UART_IER_THRI) && (ctx->ier & UART_IER_THRI)) {
@@ -598,74 +570,66 @@ static void uart_16550a_reg_write(struct uart_16550a_ctx *ctx, uint16_t offset,
 		break;
 
 	default:
-		pr_warn_once("write to undefined peripheral offset: 0x%x\n",
-			     offset);
+		pr_warn_once("write to undefined peripheral offset: 0x%x\n", offset);
 		break;
 	}
 }
 
 /**
- * uart_bus_read - generic read dispatcher resolving dynamic bus shift
- * @dev: the abstract device
- * @offset: raw byte offset from the bus
+ * uart_io_read - generic read dispatcher resolving register spacing
+ * @region: I/O mapping identifying the UART device
+ * @offset: byte offset within the I/O region
  * @size: requested access size
  *
- * Resolves the physical bus offset to the logical 16550A register index
- * based on the board-provided reg_shift. Ignores access sizes wider than
- * 8-bit, zero-extending the response to satisfy MMIO requirements.
+ * Resolves the I/O region offset to the logical 16550A register index
+ * based on reg_shift. Returns one zero-extended 8-bit register value even
+ * for wider accesses; neighboring registers are not read.
  *
  * Return: register payload.
  */
-static uint64_t uart_bus_read(struct modvm_device *dev, uint64_t offset,
-			      uint8_t size)
+static uint64_t uart_io_read(struct io_region *region, uint64_t offset, uint8_t size)
 {
+	struct device *dev = region->dev;
 	struct uart_16550a_ctx *ctx = dev->priv;
 	uint64_t ret = 0;
 	uint16_t reg_idx = offset >> ctx->reg_shift;
 
 	(void)size;
 
-	os_mutex_lock(ctx->lock);
-
 	if (reg_idx == UART_RX)
-		modvm_irq_set_level(ctx->irq, 0);
+		irq_set_level(ctx->irq, 0);
 
 	ret = uart_16550a_reg_read(ctx, reg_idx);
 
 	uart_16550a_irq_update(ctx);
-	uart_16550a_hw_fifo_refill(ctx);
+	uart_16550a_rx_fifo_refill(ctx);
 	uart_16550a_irq_update(ctx);
-
-	os_mutex_unlock(ctx->lock);
 
 	return ret;
 }
 
 /**
- * uart_bus_write - generic write dispatcher resolving dynamic bus shift
- * @dev: the abstract device
- * @offset: raw byte offset from the bus
+ * uart_io_write - generic write dispatcher resolving register spacing
+ * @region: I/O mapping identifying the UART device
+ * @offset: byte offset within the I/O region
  * @val: payload from vcpu
  * @size: requested access size
  *
  * Extracts the lowest 8 bits of the payload to write into the targeted
  * 16550A register, ignoring padding bytes from wide MMIO accesses.
  */
-static void uart_bus_write(struct modvm_device *dev, uint64_t offset,
-			   uint64_t val, uint8_t size)
+static void uart_io_write(struct io_region *region, uint64_t offset, uint64_t val, uint8_t size)
 {
+	struct device *dev = region->dev;
 	struct uart_16550a_ctx *ctx = dev->priv;
 	uint16_t reg_idx = offset >> ctx->reg_shift;
 
 	(void)size;
 
-	os_mutex_lock(ctx->lock);
-
 	uart_16550a_reg_write(ctx, reg_idx, (uint8_t)(val & 0xff));
 
 	/* writing registers may clear or trigger new interrupts */
 	uart_16550a_irq_update(ctx);
-	os_mutex_unlock(ctx->lock);
 }
 
 static void uart_rx_cb(void *data, const uint8_t *buf, size_t len)
@@ -675,8 +639,6 @@ static void uart_rx_cb(void *data, const uint8_t *buf, size_t len)
 
 	if (unlikely(len == 0))
 		return;
-
-	os_mutex_lock(ctx->lock);
 
 	for (i = 0; i < len; i++) {
 		if (unlikely(ctx->backlog_cnt >= UART_BACKLOG_SIZE)) {
@@ -688,78 +650,89 @@ static void uart_rx_cb(void *data, const uint8_t *buf, size_t len)
 		ctx->backlog_cnt++;
 	}
 
-	if (!ctx->rx_paused &&
-	    ctx->backlog_cnt >= UART_BACKLOG_HIGH_WATERMARK) {
-		modvm_chardev_pause_rx(ctx->console);
-		ctx->rx_paused = true;
+	if (!ctx->rx_paused && ctx->backlog_cnt >= UART_BACKLOG_HIGH_WATERMARK) {
+		int ret = char_pause_rx_locked(ctx->console);
+		if (ret < 0)
+			vm_report_error(ctx->vm, ret);
+		else
+			ctx->rx_paused = true;
 	}
 
-	uart_16550a_hw_fifo_refill(ctx);
+	uart_16550a_rx_fifo_refill(ctx);
 	/* evaluate the interrupt lines after state mutation */
 	uart_16550a_irq_update(ctx);
-	os_mutex_unlock(ctx->lock);
 }
 
-static const struct modvm_device_ops uart_ops = {
-	.read = uart_bus_read,
-	.write = uart_bus_write,
+static void uart_console_notify(void *data, int error)
+{
+	struct uart_16550a_ctx *ctx = data;
+	if (error < 0)
+		vm_report_error(ctx->vm, error);
+	else
+		vm_request_shutdown(ctx->vm);
+}
+
+static void uart_stop(struct device *dev);
+static const struct device_ops uart_ops = {
+	.stop = uart_stop,
+	.read = uart_io_read,
+	.write = uart_io_write,
 };
 
-static void uart_clear_rx_cb(struct modvm_device *dev)
+static void uart_stop(struct device *dev)
 {
 	struct uart_16550a_ctx *ctx = dev->priv;
 
-	if (ctx->console)
-		modvm_chardev_set_rx_cb(ctx->console, ctx->event_loop, NULL,
-					NULL);
+	if (ctx->rx_bound)
+		char_unbind_locked(ctx->console);
+	ctx->rx_bound = false;
 }
 
 /**
- * uart_instantiate - dynamically wire the UART to the requested bus
+ * uart_realize - dynamically map the UART in the requested I/O space
  * @dev: the abstract device object
- * @pdata: immutable routing configuration including target bus type
+ * @pdata: immutable routing configuration including the target I/O space
  *
  * Return: 0 upon successful initialization, or a negative error code.
  */
-static int uart_instantiate(struct modvm_device *dev, void *pdata)
+static int uart_realize(struct device *dev, void *pdata)
 {
 	struct uart_16550a_ctx *ctx;
-	struct modvm_serial_pdata *plat = pdata;
+	struct serial_pdata *plat = pdata;
 	uint64_t region_size;
 	int ret;
 
-	if (WARN_ON(!plat || !plat->irq))
-		return -EINVAL;
+	if (WARN_ON(!plat || !plat->irq || plat->reg_shift >= 61))
+		return -VM_EINVAL;
 
-	ctx = modvm_devm_zalloc(dev, sizeof(*ctx));
+	ctx = res_zalloc(&dev->resources, sizeof(*ctx));
 	if (!ctx)
-		return -ENOMEM;
+		return -VM_ENOMEM;
 
 	dev->ops = &uart_ops;
 	dev->priv = ctx;
 
 	ctx->reg_shift = plat->reg_shift;
 
-	ctx->lock = os_mutex_create();
-	if (IS_ERR(ctx->lock))
-		return PTR_ERR(ctx->lock);
-
-	ret = modvm_devm_add_action(dev, os_mutex_destroy, ctx->lock);
-	if (ret < 0) {
-		os_mutex_destroy(ctx->lock);
-		return ret;
-	}
-
 	ctx->irq = plat->irq;
 	ctx->console = plat->console;
-	ctx->event_loop = plat->event_loop;
+	ctx->io_ctx = plat->io_ctx;
+	ctx->vm = dev->ctx;
 
-	/* bind the hardware reception pin to the backend data stream */
-	modvm_chardev_set_rx_cb(ctx->console, ctx->event_loop, uart_rx_cb, ctx);
+	/* Dynamically calculate region bounds based on register shift */
+	region_size = 8ULL << ctx->reg_shift;
 
-	ret = modvm_devm_add_action(dev, uart_clear_rx_cb, dev);
-	if (ret < 0)
-		return ret;
+	struct io_region *region = io_map_register_region_locked(plat->io_space, plat->base, region_size, dev);
+	if (IS_ERR(region))
+		return PTR_ERR(region);
+
+	/* A UART may have no host console; optionality belongs to this frontend. */
+	if (ctx->console) {
+		ret = char_bind_locked(ctx->console, ctx->io_ctx, UART_BACKLOG_SIZE - UART_BACKLOG_HIGH_WATERMARK, uart_rx_cb, uart_console_notify, ctx);
+		if (ret < 0)
+			return ret;
+		ctx->rx_bound = true;
+	}
 
 	/*
 	 * strict hardware reset states per table 3.
@@ -774,26 +747,17 @@ static int uart_instantiate(struct modvm_device *dev, void *pdata)
 	uart_16550a_msr_update(ctx);
 	ctx->msr &= ~UART_MSR_ANY_DELTA;
 
-	/* Dynamically calculate region bounds based on register shift */
-	region_size = 8ULL << ctx->reg_shift;
-
-	ret = modvm_bus_register_region(plat->bus_type, plat->base, region_size,
-					dev);
-	if (ret < 0)
-		return ret;
-
-	pr_info("initialized serial terminal at %s 0x%08llx (shift: %u)\n",
-		plat->bus_type == MODVM_BUS_MMIO ? "mmio" : "pio",
-		(unsigned long long)GPA_VAL(plat->base), ctx->reg_shift);
+	pr_info("initialized serial terminal at %s 0x%08llx (shift: %u)\n", plat->io_space == IO_MMIO ? "mmio" : "pio", (unsigned long long)GPA_VAL(plat->base),
+		ctx->reg_shift);
 	return 0;
 }
 
-static const struct modvm_device_class uart_class = {
+static const struct device_desc uart_desc = {
 	.name = "uart-16550a",
-	.instantiate = uart_instantiate,
+	.realize = uart_realize,
 };
 
-static void __attribute__((constructor)) register_uart_class(void)
+static void __attribute__((constructor)) register_uart_desc(void)
 {
-	modvm_device_class_register(&uart_class);
+	device_register(&uart_desc);
 }

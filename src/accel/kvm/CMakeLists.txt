@@ -1,0 +1,8 @@
+if(NOT MODVM_GUEST_ARCH STREQUAL MODVM_HOST_ARCH)
+    message(FATAL_ERROR "KVM requires matching host/guest architectures: ${MODVM_HOST_ARCH}/${MODVM_GUEST_ARCH}")
+endif()
+file(GLOB sources CONFIGURE_DEPENDS "*.c" "${MODVM_HOST_ARCH}/*.c")
+target_sources(modvm_accel PRIVATE ${sources})
+target_include_directories(modvm_accel PRIVATE "${PROJECT_SOURCE_DIR}/src/host/include")
+find_package(Threads REQUIRED)
+target_link_libraries(modvm_accel PRIVATE Threads::Threads)

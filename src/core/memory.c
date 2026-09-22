@@ -1,49 +1,44 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 #include <modvm/core/memory.h>
-#include <modvm/os/page.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/err.h>
-#include <modvm/utils/compiler.h>
-#include <modvm/utils/types.h>
+#include <modvm/core/vm.h>
+#include <modvm/host/page.h>
+#include <modvm/util/log.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/err.h>
+#include <modvm/util/compiler.h>
+#include <modvm/util/types.h>
 
-#include "internal.h"
+#include "memory_internal.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "memory: " fmt
 
 /**
- * modvm_mem_space_init - initialize a fresh physical memory controller
+ * mem_space_init - initialize a guest physical memory space
  * @space: the memory space context to initialize
- * @map_cb: function invoked when a new memory region needs hardware mapping
- * @unmap_cb: function invoked to tear down hardware mappings
- * @data: private context data passed to the mapping hooks
  *
  * Return: 0 on success, or a negative error code.
  */
-int modvm_mem_space_init(struct modvm_mem_space *space,
-			 modvm_mem_map_cb_t map_cb,
-			 modvm_mem_unmap_cb_t unmap_cb, void *data)
+int mem_space_init(struct mem_space *space)
 {
 	if (WARN_ON(!space))
-		return -EINVAL;
+		return -VM_EINVAL;
 
 	INIT_LIST_HEAD(&space->regions);
 	space->total_ram = 0;
-	space->host_page_size = os_page_size();
-	space->map_cb = map_cb;
-	space->unmap_cb = unmap_cb;
-	space->map_data = data;
+	space->host_page_size = host_page_size();
+	if (!space->host_page_size)
+		return -VM_EIO;
 
 	return 0;
 }
 
 /**
- * modvm_mem_region_is_overlap - check if two memory ranges overlap
+ * mem_region_is_overlap - check if two memory ranges overlap
  * @base1: start address of first region
  * @size1: length of first region
  * @base2: start address of second region
@@ -51,141 +46,123 @@ int modvm_mem_space_init(struct modvm_mem_space *space,
  *
  * Return: true if overlapping, false otherwise.
  */
-static bool modvm_mem_region_is_overlap(gpa_t base1, size_t size1, gpa_t base2,
-					size_t size2)
+static bool mem_region_is_overlap(gpa_t base1, size_t size1, gpa_t base2, size_t size2)
 {
-	return GPA_CMP(base1, <, gpa_add(base2, size2)) &&
-	       GPA_CMP(base2, <, gpa_add(base1, size1));
+	return GPA_CMP(base1, <, gpa_add(base2, size2)) && GPA_CMP(base2, <, gpa_add(base1, size1));
 }
 
 /**
- * modvm_mem_region_add - map a contiguous host memory block to guest physics
- * @space: the memory space to attach this region to
- * @gpa: the starting physical address requested by the guest
+ * vm_add_ram - allocate and map a guest physical memory region
+ * @ctx: the VM being constructed
+ * @gpa: the starting guest physical address
  * @size: capacity of the memory bank in bytes
- * @flags: bitmask governing read/write/execute permissions
+ * @flags: memory permission and attribute flags
  *
  * Validates alignment and topological overlap before allocating OS-level
- * page-aligned anonymous memory and invoking the hypervisor mapping hook.
+ * page-aligned anonymous memory and registering the region with the accelerator.
  *
  * Return: 0 on success, negative error code on conflict or exhaustion.
  */
-int modvm_mem_region_add(struct modvm_mem_space *space, gpa_t gpa, size_t size,
-			 uint32_t flags)
+int vm_add_ram(struct vm_ctx *ctx, gpa_t gpa, size_t size, uint32_t flags)
 {
-	struct modvm_mem_region *reg;
-	struct modvm_mem_region *pos;
+	struct mem_region *reg;
+	struct mem_region *pos;
 	int ret;
 
-	if (WARN_ON(!space || size == 0))
-		return -EINVAL;
+	if (!ctx || !size)
+		return -VM_EINVAL;
+	if (ctx->state != VM_BUILDING || atomic_load(&ctx->stop_requested))
+		return -VM_EBUSY;
+	struct mem_space *space = &ctx->mem_space;
+	if (!space->host_page_size || !ctx->accel.desc)
+		return -VM_EINVAL;
+	if (!ctx->accel.desc->accel_ops->map_ram)
+		return -VM_ENOTSUP;
+	if (size > SIZE_MAX - space->total_ram)
+		return -VM_EOVERFLOW;
 
 	if (UINT64_MAX - GPA_VAL(gpa) < size) {
-		pr_err("memory region 0x%llx + size 0x%zx wraps around address limit\n",
-		       (unsigned long long)GPA_VAL(gpa), size);
-		return -EOVERFLOW;
+		pr_err("memory region 0x%llx + size 0x%zx wraps around address limit\n", (unsigned long long)GPA_VAL(gpa), size);
+		return -VM_EOVERFLOW;
 	}
 
-	if (GPA_VAL(gpa) % space->host_page_size != 0 ||
-	    size % space->host_page_size != 0) {
-		pr_err("region (gpa 0x%llx, size 0x%zx) strictly requires %zu bytes alignment\n",
-		       (unsigned long long)GPA_VAL(gpa), size,
-		       space->host_page_size);
-		return -EINVAL;
+	if (GPA_VAL(gpa) % space->host_page_size != 0 || size % space->host_page_size != 0) {
+		pr_err("region (gpa 0x%llx, size 0x%zx) strictly requires %zu bytes alignment\n", (unsigned long long)GPA_VAL(gpa), size, space->host_page_size);
+		return -VM_EINVAL;
 	}
 
 	list_for_each_entry(pos, &space->regions, node)
 	{
-		if (modvm_mem_region_is_overlap(gpa, size, pos->gpa,
-						pos->size)) {
-			pr_err("topology overlap detected at gpa 0x%llx\n",
-			       (unsigned long long)GPA_VAL(gpa));
-			return -EBUSY;
+		if (mem_region_is_overlap(gpa, size, pos->gpa, pos->size)) {
+			pr_err("topology overlap detected at gpa 0x%llx\n", (unsigned long long)GPA_VAL(gpa));
+			return -VM_EBUSY;
 		}
+	}
+
+	struct io_region *io;
+	list_for_each_entry(io, &ctx->io_map.mmio_regions, node)
+	{
+		if (mem_region_is_overlap(gpa, size, io->base, io->size))
+			return -VM_EBUSY;
 	}
 
 	reg = calloc(1, sizeof(*reg));
 	if (!reg)
-		return -ENOMEM;
+		return -VM_ENOMEM;
 
-	reg->hva = os_page_alloc(size);
+	reg->hva = host_page_alloc(size);
 	if (IS_ERR(reg->hva)) {
 		ret = PTR_ERR(reg->hva);
-		pr_err("failed to allocate host backing memory for gpa 0x%llx\n",
-		       (unsigned long long)GPA_VAL(gpa));
+		pr_err("failed to allocate host backing memory for gpa 0x%llx\n", (unsigned long long)GPA_VAL(gpa));
 		free(reg);
 		return ret;
 	}
 
-	/* 
-	 * Don't do this :)
-	 * We rely on lazy allocation
-	 * 
-	 * memset(reg->hva, 0, size);
-	 */
+	/* Anonymous mappings start zeroed; leave pages untouched for demand allocation. */
 
 	reg->gpa = gpa;
 	reg->size = size;
 	reg->flags = flags;
 
-	if (space->map_cb) {
-		ret = space->map_cb(space, reg, space->map_data);
-		if (ret != 0) {
-			pr_err("hypervisor backend actively rejected mapping for gpa 0x%llx\n",
-			       (unsigned long long)GPA_VAL(gpa));
-			os_page_free(reg->hva, reg->size);
-			free(reg);
-			return ret;
-		}
+	ret = ctx->accel.desc->accel_ops->map_ram(&ctx->accel, reg);
+	if (ret < 0) {
+		/* Failed registration retains no native reference to the backing memory. */
+		host_page_free(reg->hva, reg->size);
+		free(reg);
+		return ret;
 	}
 
 	list_add_tail(&reg->node, &space->regions);
 	space->total_ram += size;
 
-	pr_debug("mounted hardware ram: 0x%08llx - 0x%08llx (%zu MB)\n",
-		 (unsigned long long)GPA_VAL(gpa),
-		 (unsigned long long)(GPA_VAL(gpa) + size - 1),
-		 size / (1024 * 1024));
+	pr_debug("mounted hardware ram: 0x%08llx - 0x%08llx (%zu MB)\n", (unsigned long long)GPA_VAL(gpa), (unsigned long long)(GPA_VAL(gpa) + size - 1), size / (1024 * 1024));
 
 	return 0;
 }
 
-/**
- * modvm_mem_gpa_to_hva - resolve a guest physical address
- * @space: the memory space containing the topology
- * @gpa: the absolute physical address requested
- *
- * Traverses the topology to translate guest physical coordinates into
- * host virtual pointers for direct memory payload manipulation.
- *
- * Return: host virtual address pointer, or NULL if out of bounds.
- */
-void *modvm_mem_gpa_to_hva(struct modvm_mem_space *space, gpa_t gpa)
+/* Keep region lookup private to the memory subsystem. */
+static struct mem_region *find_region(struct mem_space *space, gpa_t gpa)
 {
-	struct modvm_mem_region *pos;
-
-	if (WARN_ON(!space))
+	if (!space)
 		return NULL;
-
-	list_for_each_entry(pos, &space->regions, node)
+	struct mem_region *reg;
+	uint64_t addr = GPA_VAL(gpa);
+	list_for_each_entry(reg, &space->regions, node)
 	{
-		if (GPA_CMP(gpa, >=, pos->gpa) &&
-		    GPA_CMP(gpa, <, gpa_add(pos->gpa, pos->size))) {
-			uint64_t offset = gpa_offset(gpa, pos->gpa);
-			return (uint8_t *)pos->hva + offset;
-		}
+		uint64_t base = GPA_VAL(reg->gpa);
+		if (addr >= base && addr - base < reg->size)
+			return reg;
 	}
-
 	return NULL;
 }
 
 /**
- * modvm_mem_space_destroy - dismantle the physical memory controller
+ * mem_space_destroy - release all guest physical memory mappings
  * @space: the memory space to destroy
  */
-void modvm_mem_space_destroy(struct modvm_mem_space *space)
+void mem_space_destroy(struct mem_space *space)
 {
-	struct modvm_mem_region *pos, *n;
+	struct mem_region *pos, *n;
 
 	if (WARN_ON(!space))
 		return;
@@ -194,49 +171,34 @@ void modvm_mem_space_destroy(struct modvm_mem_space *space)
 	{
 		list_del(&pos->node);
 
-		/* Explicitly instruct the hardware to tear down EPT/NPT mappings */
-		if (space->unmap_cb)
-			space->unmap_cb(space, pos, space->map_data);
-
-		os_page_free(pos->hva, pos->size);
+		host_page_free(pos->hva, pos->size);
 		free(pos);
 	}
 
 	space->total_ram = 0;
 }
 
-/**
- * modvm_mem_gpa_to_hva_clamp - safely resolve GPA with boundary truncation
- * @space: the memory space containing the topology
- * @gpa: the absolute physical address requested
- * @len: the requested payload length
- * @out_len: pointer to store the contiguous maximum length available
- *
- * Traverses the topology to translate guest physical coordinates into host
- * virtual pointers. If the requested length exceeds the contiguous bound of
- * the current memory region, out_len is truncated to the safe boundary.
- *
- * Return: host virtual address pointer, or NULL if unmapped.
- */
-void *modvm_mem_gpa_to_hva_clamp(struct modvm_mem_space *space, gpa_t gpa,
-				 size_t len, size_t *out_len)
+/* Resolve one contiguous, permission-checked chunk of a larger transfer. */
+void *mem_map_chunk(struct mem_space *space, gpa_t gpa, size_t len, bool write, size_t *out_len)
 {
-	struct modvm_mem_region *pos;
-
-	if (WARN_ON(!space || !out_len))
+	if (!out_len)
 		return NULL;
+	*out_len = 0;
+	if (!len || len > UINT64_MAX - GPA_VAL(gpa))
+		return NULL;
+	struct mem_region *reg = find_region(space, gpa);
+	if (!reg || (write && (reg->flags & MEM_READONLY)))
+		return NULL;
+	size_t offset = gpa_offset(gpa, reg->gpa);
+	size_t available = reg->size - offset;
+	*out_len = len < available ? len : available;
+	return (uint8_t *)reg->hva + offset;
+}
 
-	list_for_each_entry(pos, &space->regions, node)
-	{
-		if (GPA_CMP(gpa, >=, pos->gpa) &&
-		    GPA_CMP(gpa, <, gpa_add(pos->gpa, pos->size))) {
-			uint64_t offset = gpa_offset(gpa, pos->gpa);
-			size_t avail = pos->size - offset;
-
-			*out_len = (len < avail) ? len : avail;
-			return (uint8_t *)pos->hva + offset;
-		}
-	}
-
-	return NULL;
+/* Resolve an entire span; never truncate a fixed-size guest structure. */
+void *mem_map_range(struct mem_space *space, gpa_t gpa, size_t len, bool write)
+{
+	size_t available;
+	void *hva = mem_map_chunk(space, gpa, len, write, &available);
+	return available == len ? hva : NULL;
 }

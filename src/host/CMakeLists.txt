@@ -1,0 +1,5 @@
+add_library(modvm_host_options INTERFACE)
+add_library(modvm_host STATIC)
+modvm_module_headers(modvm_host host util)
+target_include_directories(modvm_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_subdirectory(${MODVM_OS})

@@ -1,78 +1,51 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef MODVM_CORE_MEMORY_H
 #define MODVM_CORE_MEMORY_H
+#include <stdbool.h>
 
-#include <modvm/utils/list.h>
-#include <modvm/utils/types.h>
+#include <modvm/util/list.h>
+#include <modvm/util/types.h>
 
-#define MODVM_MEM_READONLY (1U << 0)
-#define MODVM_MEM_EXEC (1U << 1)
+#define MEM_READONLY (1U << 0)
+#define MEM_EXEC (1U << 1)
+/* Mapped RAM retained for firmware/platform use, excluded from guest allocators. */
+#define MEM_RESERVED (1U << 2)
 
-struct modvm_mem_space;
-struct modvm_mem_region;
-
-/**
- * typedef modvm_mem_map_cb_t - architecture-specific callback for hypervisor memory mapping
- * @space: the memory space context
- * @region: the newly allocated region requiring hypervisor mapping
- * @data: architecture-specific context passed during initialization
- */
-typedef int (*modvm_mem_map_cb_t)(struct modvm_mem_space *space,
-				  struct modvm_mem_region *region, void *data);
+struct mem_space;
+struct mem_region;
 
 /**
- * typedef modvm_mem_unmap_cb_t - architecture-specific callback for tearing down mappings
- * @space: the memory space context
- * @region: the memory region to unmap from the hardware
- * @data: architecture-specific context passed during initialization
- */
-typedef void (*modvm_mem_unmap_cb_t)(struct modvm_mem_space *space,
-				     struct modvm_mem_region *region,
-				     void *data);
-
-/**
- * struct modvm_mem_region - contiguous block of guest physical memory
+ * struct mem_region - contiguous block of guest physical memory
  * @node: linked list node for memory space iterations
  * @gpa: guest physical address
  * @size: size of the memory block in bytes
  * @hva: host virtual address backing this region
  * @flags: access permissions and memory traits
- * @priv: opaque pointer for backend-specific tracking (e.g., hardware slot IDs)
  */
-struct modvm_mem_region {
+struct mem_region {
 	struct list_head node;
 	gpa_t gpa;
 	size_t size;
 	void *hva;
 	uint32_t flags;
-	void *priv;
 };
 
 /**
- * struct modvm_mem_space - physical memory controller for a virtual machine
+ * struct mem_space - guest physical memory space
  * @regions: list of registered memory regions
- * @total_ram: aggregate size of available memory in bytes
+ * @total_ram: sum of registered region sizes in bytes, including reserved regions
  * @host_page_size: native page size of the underlying operating system
- * @map_cb: hook to notify hypervisor of new mappings
- * @unmap_cb: hook to notify hypervisor of mapping removal
- * @map_data: private context for the mapping hooks
  */
-struct modvm_mem_space {
+struct mem_space {
 	struct list_head regions;
 	size_t total_ram;
 	size_t host_page_size;
-
-	modvm_mem_map_cb_t map_cb;
-	modvm_mem_unmap_cb_t unmap_cb;
-	void *map_data;
 };
 
-int modvm_mem_space_init(struct modvm_mem_space *space,
-			 modvm_mem_map_cb_t map_cb,
-			 modvm_mem_unmap_cb_t unmap_cb, void *data);
-void modvm_mem_space_destroy(struct modvm_mem_space *space);
-void *modvm_mem_gpa_to_hva(struct modvm_mem_space *space, gpa_t gpa);
-void *modvm_mem_gpa_to_hva_clamp(struct modvm_mem_space *space, gpa_t gpa,
-				 size_t len, size_t *out_len);
+/* RAM topology is frozen after VM construction. Returned mappings are borrowed
+ * until VM destruction; all users and the accelerator stop before RAM is freed. */
+void *mem_map_range(struct mem_space *space, gpa_t gpa, size_t len, bool write);
+/* Maps up to the region boundary; failure sets out_len to zero. */
+void *mem_map_chunk(struct mem_space *space, gpa_t gpa, size_t len, bool write, size_t *out_len);
 
 #endif /* MODVM_CORE_MEMORY_H */

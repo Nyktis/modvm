@@ -1,197 +1,119 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#include <stdio.h>
 #include <string.h>
-#include <errno.h>
 
 #include <modvm/core/loader.h>
-#include <modvm/core/ctxm.h>
-#include <modvm/utils/log.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/types.h>
-
-#include <modvm/internal/loader.h>
+#include <modvm/core/vm.h>
+#include <modvm/errno.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/log.h>
+#include <modvm/util/res_pool.h>
+#include <modvm/util/types.h>
 
 #undef pr_fmt
 #define pr_fmt(fmt) "loader: " fmt
 
-#define MAX_LOADER_CLASSES 8
+#define MAX_LOADER_DESCS 8
 
-static const struct modvm_loader_class *loader_classes[MAX_LOADER_CLASSES];
-static int nr_loader_classes = 0;
+static const struct loader_desc *loader_descs[MAX_LOADER_DESCS];
+static unsigned int nr_loader_descs;
 
 struct loader_instance_ctx {
-	const struct modvm_loader_class *cls;
+	const struct loader_desc *desc;
 	void *priv;
 };
 
-static void modvm_loader_instance_release(void *data)
+static void loader_instance_cleanup(void *data)
 {
 	struct loader_instance_ctx *inst = data;
 
-	if (inst->cls->release && inst->priv)
-		inst->cls->release(inst->priv);
+	if (inst->desc->destroy && inst->priv)
+		inst->desc->destroy(inst->priv);
 }
 
 /**
- * modvm_loader_class_register - statically register a boot protocol blueprint
- * @cls: the loader class definition to expose to the system
+ * loader_register - register a boot protocol implementation
+ * @desc: the loader implementation description to expose to the system
  */
-void modvm_loader_class_register(const struct modvm_loader_class *cls)
+void loader_register(const struct loader_desc *desc)
 {
-	if (WARN_ON(!cls || !cls->name))
-		return;
+	if (!desc || !desc->name || !*desc->name || !desc->load || !desc->setup_bsp)
+		panic(pr_fmt("invalid description\n"));
 
-	if (WARN_ON(nr_loader_classes >= MAX_LOADER_CLASSES)) {
-		pr_err("maximum loader registry capacity exceeded\n");
-		return;
+	for (unsigned int i = 0; i < nr_loader_descs; i++) {
+		if (!strcmp(loader_descs[i]->name, desc->name))
+			panic(pr_fmt("duplicate registration: %s\n"), desc->name);
 	}
 
-	loader_classes[nr_loader_classes++] = cls;
+	if (nr_loader_descs == MAX_LOADER_DESCS)
+		panic(pr_fmt("registry full\n"));
+
+	loader_descs[nr_loader_descs++] = desc;
 }
 
-static const struct modvm_loader_class *
-modvm_loader_class_find(const char *name)
+static const struct loader_desc *loader_find(const char *name)
 {
-	int i;
-
 	if (WARN_ON(!name))
 		return NULL;
 
-	for (i = 0; i < nr_loader_classes; i++) {
-		if (strcmp(loader_classes[i]->name, name) == 0)
-			return loader_classes[i];
+	for (unsigned int i = 0; i < nr_loader_descs; i++) {
+		if (!strcmp(loader_descs[i]->name, name))
+			return loader_descs[i];
 	}
 
 	return NULL;
 }
 
 /**
- * modvm_loader_execute - discover, invoke, and persist a boot protocol
- * @ctx: the global machine context
+ * loader_execute - load guest images and initialize the bootstrap processor
+ * @ctx: the owning VM context
  * @name: the string identifier of the requested protocol
- * @opts: arbitrary configuration string consumed by the loader backend
+ * @opts: configuration string consumed by the selected loader
  *
  * This function decouples the motherboard topology from the software boot
  * process. It delegates memory injection and CPU state manipulation to the
- * selected loader, managing its lifecycle via ctxm.
+ * selected loader, managing its lifecycle in the VM resource pool.
  *
  * Return: 0 on success, or a negative error code.
  */
-int modvm_loader_execute(struct modvm_ctx *ctx, const char *name,
-			 const char *opts)
+int loader_execute(struct vm_ctx *ctx, const char *name, const char *opts)
 {
-	const struct modvm_loader_class *cls;
+	const struct loader_desc *desc;
 	struct loader_instance_ctx *inst;
 	int ret;
 
-	if (WARN_ON(!ctx || !name || !opts))
-		return -EINVAL;
+	if (WARN_ON(!ctx || !name || !opts || !ctx->vcpus || !ctx->config.nr_vcpus || !ctx->vcpus[0]))
+		return -VM_EINVAL;
 
-	cls = modvm_loader_class_find(name);
-	if (!cls) {
+	desc = loader_find(name);
+	if (!desc) {
 		pr_err("boot protocol '%s' is not supported\n", name);
-		return -ENOENT;
+		return -VM_ENOENT;
 	}
 
-	inst = modvm_ctxm_zalloc(ctx, sizeof(*inst));
+	inst = res_zalloc(&ctx->resources, sizeof(*inst));
 	if (!inst)
-		return -ENOMEM;
+		return -VM_ENOMEM;
 
-	inst->cls = cls;
+	inst->desc = desc;
 
-	if (cls->load) {
-		ret = cls->load(ctx, opts, &inst->priv);
-		if (ret < 0) {
-			pr_err("loader '%s' failed to inject payloads into memory\n",
-			       name);
-			return ret;
-		}
-	}
-
-	/* Enqueue cleanup callback for successful teardown */
-	ret = __modvm_ctxm_add_action(ctx, modvm_loader_instance_release, inst);
+	/* Own any published loader state, including a partially failed load. */
+	ret = res_add_action_or_reset(&ctx->resources, loader_instance_cleanup, inst);
 	if (ret < 0) {
-		modvm_loader_instance_release(inst);
 		return ret;
 	}
 
-	if (cls->setup_bsp && ctx->vcpus[0]) {
-		ret = cls->setup_bsp(ctx->vcpus[0], inst->priv);
-		if (ret < 0) {
-			pr_err("loader '%s' failed to manipulate processor state\n",
-			       name);
-			return ret;
-		}
+	ret = desc->load(ctx, opts, &inst->priv);
+	if (ret < 0) {
+		pr_err("loader '%s' failed to inject payloads into memory\n", name);
+		return ret;
 	}
 
-	pr_info("successfully handed over execution to '%s' boot protocol\n",
-		name);
-	return 0;
-}
-
-/**
- * modvm_loader_load_raw - stream a binary payload directly into guest memory
- * @space: the target physical memory space
- * @path: host filesystem path to the payload
- * @gpa: destination physical address for the payload
- *
- * A generic utility function utilized by legacy raw loaders and testing
- * infrastructures to bypass complex protocol parsing.
- *
- * Return: 0 on success, or a negative error code.
- */
-int modvm_loader_load_raw(struct modvm_mem_space *space, const char *path,
-			  gpa_t gpa)
-{
-	FILE *fp;
-	long size;
-	size_t read_len;
-	void *hva;
-
-	if (WARN_ON(!space || !path))
-		return -EINVAL;
-
-	fp = fopen(path, "rb");
-	if (!fp) {
-		pr_err("failed to acquire image handle: %s (errno: %d)\n", path,
-		       errno);
-		return -ENOENT;
+	ret = desc->setup_bsp(ctx->vcpus[0], inst->priv);
+	if (ret < 0) {
+		pr_err("loader '%s' failed to manipulate processor state\n", name);
+		return ret;
 	}
 
-	if (fseek(fp, 0, SEEK_END) < 0) {
-		fclose(fp);
-		return -EIO;
-	}
-
-	size = ftell(fp);
-	if (size <= 0) {
-		pr_err("payload image rejected due to zero or negative length: %s\n",
-		       path);
-		fclose(fp);
-		return -EINVAL;
-	}
-
-	rewind(fp);
-
-	hva = modvm_mem_gpa_to_hva(space, gpa);
-	if (!hva) {
-		pr_err("address translation trap: unmapped gpa 0x%llx\n",
-		       (unsigned long long)GPA_VAL(gpa));
-		fclose(fp);
-		return -EFAULT;
-	}
-
-	read_len = fread(hva, 1, (size_t)size, fp);
-	if (read_len != (size_t)size) {
-		pr_err("short stream read: expected %ld bytes, acquired %zu\n",
-		       size, read_len);
-		fclose(fp);
-		return -EIO;
-	}
-
-	pr_info("successfully streamed %zu bytes from '%s' to gpa 0x%08llx\n",
-		read_len, path, (unsigned long long)GPA_VAL(gpa));
-
-	fclose(fp);
+	pr_info("successfully handed over execution to '%s' boot protocol\n", name);
 	return 0;
 }

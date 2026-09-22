@@ -39,8 +39,8 @@
 #ifndef MODVM_SRC_HW_VIRTIO_PCI_REG_H
 #define MODVM_SRC_HW_VIRTIO_PCI_REG_H
 
-#include <modvm/utils/types.h>
-#include <modvm/utils/compiler.h>
+#include <modvm/util/types.h>
+#include <modvm/util/compiler.h>
 
 /* Virtio ABI version, this must match exactly */
 #define VIRTIO_PCI_ABI_VERSION 0
@@ -48,7 +48,7 @@
 /* The bit of the ISR which indicates a device configuration change. */
 #define VIRTIO_PCI_ISR_CONFIG 0x2
 
-/* IDs for different capabilities.  Must all exist. */
+/* VirtIO PCI capability type IDs. */
 
 /* Common configuration */
 #define VIRTIO_PCI_CAP_COMMON_CFG 1

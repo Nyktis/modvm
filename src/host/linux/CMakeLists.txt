@@ -1,0 +1,6 @@
+add_subdirectory(../posix "${CMAKE_CURRENT_BINARY_DIR}/posix")
+target_sources(modvm_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/service.c")
+if(ENABLE_HARDENING)
+    target_compile_definitions(modvm_host_options INTERFACE _FORTIFY_SOURCE=2)
+    target_link_options(modvm_host_options INTERFACE "-Wl,-z,relro,-z,now")
+endif()

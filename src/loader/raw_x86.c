@@ -1,65 +1,63 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <modvm/errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 #include <modvm/core/loader.h>
+#include <modvm/core/vm.h>
 #include <modvm/core/vcpu.h>
-#include <modvm/internal/arch/x86/regs.h>
-#include <modvm/utils/bug.h>
-#include <modvm/utils/log.h>
+#include <modvm/arch/x86/regs.h>
+#include <modvm/util/bug.h>
+#include <modvm/util/log.h>
 
-#include <modvm/internal/loader.h>
+#include "image.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "raw_loader: " fmt
 
-static int raw_loader_load(struct modvm_ctx *ctx, const char *opts,
-			   void **out_priv)
+static int raw_loader_load(struct vm_ctx *ctx, const char *opts, void **out_priv)
 {
 	/* Treat opts directly as the file path for simplicity */
 	if (WARN_ON(!opts || strlen(opts) == 0))
-		return -EINVAL;
+		return -VM_EINVAL;
 
 	*out_priv = NULL; /* No state needed */
 
-	return modvm_loader_load_raw(&ctx->accel.mem_space, opts,
-				     TO_GPA(0x0000));
-	;
+	return loader_load_raw(&ctx->mem_space, opts, TO_GPA(0x0000));
 }
 
-static int raw_loader_setup_bsp(struct modvm_vcpu *vcpu, void *priv)
+static int raw_loader_setup_bsp(struct vcpu *vcpu, void *priv)
 {
-	struct modvm_x86_sregs sregs;
+	struct x86_sregs sregs;
 	int ret;
 
 	(void)priv;
 
-	ret = modvm_vcpu_get_regs(vcpu, MODVM_REG_SREGS, &sregs, sizeof(sregs));
+	ret = vcpu_get_regs(vcpu, REG_SREGS, &sregs, sizeof(sregs));
 	if (WARN_ON(ret < 0))
 		return ret;
 
-	/* Legacy PC Real Mode initialization vector */
-	sregs.cs.selector = 0xF000;
-	sregs.cs.base = 0xFFFF0000;
+	/* Raw programs start in real mode at the load address, GPA zero. */
+	sregs.cs.selector = 0;
+	sregs.cs.base = 0;
 
-	ret = modvm_vcpu_set_regs(vcpu, MODVM_REG_SREGS, &sregs, sizeof(sregs));
+	ret = vcpu_set_regs(vcpu, REG_SREGS, &sregs, sizeof(sregs));
 	if (WARN_ON(ret < 0))
 		return ret;
 
-	ret = modvm_vcpu_set_reg(vcpu, MODVM_X86_REG_RIP, 0xFFF0);
+	ret = vcpu_set_reg(vcpu, X86_REG_RIP, 0);
 	if (WARN_ON(ret < 0))
 		return ret;
 
-	ret = modvm_vcpu_set_reg(vcpu, MODVM_X86_REG_RFLAGS, 0x02);
+	ret = vcpu_set_reg(vcpu, X86_REG_RFLAGS, 0x02);
 	if (WARN_ON(ret < 0))
 		return ret;
 
 	return 0;
 }
 
-static const struct modvm_loader_class raw_class = {
+static const struct loader_desc raw_desc = {
 	.name = "raw-x86",
 	.load = raw_loader_load,
 	.setup_bsp = raw_loader_setup_bsp,
@@ -67,5 +65,5 @@ static const struct modvm_loader_class raw_class = {
 
 static void __attribute__((constructor)) register_raw_loader(void)
 {
-	modvm_loader_class_register(&raw_class);
+	loader_register(&raw_desc);
 }

@@ -2,28 +2,25 @@
 #ifndef MODVM_HW_VIRTIO_VIRTIO_PCI_H
 #define MODVM_HW_VIRTIO_VIRTIO_PCI_H
 
-#include <modvm/utils/types.h>
+#include <modvm/util/types.h>
 
-struct modvm_pci_bus;
+struct pci_bus;
 struct virtio_device;
-struct modvm_mem_space;
 
 /**
  * struct virtio_pci_pdata - platform routing data for a Virtio-PCI transport
  * @pci_bus: the PCI host bridge bus to attach to
- * @vdev: the specific virtio backend payload to wrap
- * @devfn: requested PCI Device and Function number (e.g., Slot << 3)
+ * @vdev: VirtIO device model to attach to this transport
+ * @devfn: requested device/function number, or PCI_AUTO_DEVFN for automatic assignment
  * @interrupt_pin: PCI interrupt pin (1=INTA, 2=INTB, 3=INTC, 4=INTD)
- * @bar0_base: MMIO base address allocated by the motherboard for BAR0
- * @mem_space: injected physical memory space
+ * @bar0_base: requested BAR0 address, or PCI_AUTO_MMIO for automatic allocation
  */
 struct virtio_pci_pdata {
-	struct modvm_pci_bus *pci_bus;
+	struct pci_bus *pci_bus;
 	struct virtio_device *vdev;
 	pci_devfn_t devfn;
 	uint8_t interrupt_pin;
 	gpa_t bar0_base;
-	struct modvm_mem_space *mem_space;
 };
 
 #endif /* MODVM_HW_VIRTIO_VIRTIO_PCI_H */
